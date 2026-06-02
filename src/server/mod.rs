@@ -19,6 +19,11 @@ const CHANNEL_COUNT: usize = 2;
 /// polling granularity.
 const SERVICE_TIMEOUT_MS: u32 = 15;
 
+/// Server tick rate in ticks per second.
+pub(crate) const TICK_RATE: u32 = 10;
+/// Interval between ticks in milliseconds.
+pub(crate) const TICK_INTERVAL_MS: u64 = 1000 / TICK_RATE as u64;
+
 /// Global one-shot guard ensuring `enet_initialize` is called exactly once.
 static ENET_INIT: Once = Once::new();
 

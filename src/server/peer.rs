@@ -51,10 +51,7 @@ impl PeerEntry {
             conn_magic: [0; 4],
             player_state_raw: Vec::new(),
             snap_reader: SnapshotReader::new(),
-            // [TODO]
-            // there is a wrong with ack
-            // - fix ack
-            snap_writer: SnapshotWriter::new_unacked(),
+            snap_writer: SnapshotWriter::new(),
         }
     }
 

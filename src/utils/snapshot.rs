@@ -208,6 +208,15 @@ impl SnapshotWriter {
     /// state, resync status, and the keyframe interval.
     pub fn generate_delta(&mut self, new_state: &[u8]) -> Vec<u8> {
         let new_len = new_state.len().min(MAX_STATE_SIZE);
+
+        tracing::debug!(
+            "[SNAPSHOT]generate_delta new_len={} resync={} windows_is_empty={} window_len={}",
+            new_len,
+            self.resync,
+            self.window.is_empty(),
+            self.window.len()
+        );
+
         if self.resync {
             return self.emit_raw(new_state, new_len);
         }
@@ -215,9 +224,12 @@ impl SnapshotWriter {
             return self.emit_raw(new_state, new_len);
         }
         if self.window.len() >= MAX_WINDOW {
-            self.resync = true;
-            self.window.clear();
-            return self.emit_raw(new_state, new_len);
+            // Window is at capacity — let add_to_window truncate old
+            // entries naturally. No need for a destructive resync.
+            tracing::warn!(
+                "[SNAPSHOT] window at capacity ({} entries), old entries will be evicted",
+                self.window.len()
+            );
         }
         if self.force_next_keyframe {
             self.force_next_keyframe = false;
@@ -238,15 +250,21 @@ impl SnapshotWriter {
     ///
     /// Returns `true` if the ack matched the pending frame.
     ///
-    /// Does **not** prune the snapshot window on ack. Sequence numbers
-    /// are `u8` and wrap around; numeric comparisons can delete the
-    /// fresh baseline after wrap, causing future keyframes to use an
-    /// invalid base. Window size is already bounded in `add_to_window`.
+    /// Prunes the snapshot window of entries at or before the acked
+    /// sequence, keeping the window small. Uses wrapping comparison to
+    /// handle `u8` overflow safely (window spread is well within 127).
     pub fn ack(&mut self, seq: u8) -> bool {
         let matched = self.pending_ack_seq == Some(seq);
         if matched {
             self.pending_ack_seq = None;
             self.missed_acks = 0;
+
+            // Keep entries at or after the acked sequence (the acked
+            // entry itself is still a valid base for future deltas).
+            // Wrapping distance 0..=127 covers seq itself and anything
+            // after it. Older entries (< seq) are safe to discard.
+            self.window.retain(|e| e.sequence.wrapping_sub(seq) <= 127);
+
             if self.resync {
                 self.resync = false;
                 self.force_next_keyframe = true;
@@ -312,8 +330,9 @@ impl SnapshotWriter {
         let xor_buf = xor_diff(new_state, base_data.as_slice(), new_len);
         let non_zero = xor_buf.iter().filter(|&&b| b != 0).count();
         tracing::debug!(
-            "[SNAPSHOT] KEYFRAME baseSeq={} xor_total={} non_zero={} pct={:.1}%",
+            "[SNAPSHOT] KEYFRAME baseSeq={} saveSeq={} xor_total={} non_zero={} pct={:.1}%",
             base_sequence,
+            sv,
             xor_buf.len(),
             non_zero,
             non_zero as f64 / xor_buf.len() as f64 * 100.0

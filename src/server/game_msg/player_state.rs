@@ -32,33 +32,30 @@ impl crate::server::state::ServerState {
         peer.player_state_raw.clear();
         peer.player_state_raw.extend(raw_state);
 
-        self.sync_frame()
+        Some(())
     }
 
-    fn sync_frame(&mut self) -> Option<()> {
-        // [TODO]
-        // - refact those code
-
-        let all_entry: Vec<(u8, Vec<u8>)> = self
+    pub(crate) fn sync_frame(&mut self) -> Option<()> {
+        let all_entry: Vec<(u8, u32, Vec<u8>)> = self
             .peers
             .values()
             .filter(|pr| !(pr.player_state_raw.is_empty()))
-            .map(|pr| (pr.player_id, pr.player_state_raw.clone()))
+            .map(|pr| (pr.player_id, pr.level_id, pr.player_state_raw.clone()))
             .collect();
 
         for peer in self.peers.values_mut() {
             let entry: Vec<u8> = all_entry
                 .iter()
-                .filter(|(player, _)| *player != peer.player_id)
-                .map(|(player_id, player_state)| {
-                    [
-                        vec![*player_id],
-                        (player_state.len() as u32).to_le_bytes().to_vec(),
-                        player_state.to_vec(),
-                    ]
-                    .concat()
+                .filter(|(player, level_id, _)| {
+                    *player != peer.player_id && *level_id == peer.level_id
                 })
-                .flatten()
+                .flat_map(|(id, _, state)| {
+                    let mut buf = Vec::with_capacity(1 + 4 + state.len());
+                    buf.push(*id);
+                    buf.extend((state.len() as u32).to_le_bytes());
+                    buf.extend(state);
+                    buf
+                })
                 .collect();
             if entry.is_empty() {
                 continue;

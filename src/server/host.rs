@@ -5,7 +5,7 @@
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use enet_sys::{
     _ENetEventType_ENET_EVENT_TYPE_CONNECT as ENET_EVENT_TYPE_CONNECT,
@@ -17,7 +17,7 @@ use enet_sys::{
 };
 
 use super::state::ServerState;
-use super::{CHANNEL_COUNT, ENET_INIT, MAX_CLIENTS, SERVICE_TIMEOUT_MS};
+use super::{CHANNEL_COUNT, ENET_INIT, MAX_CLIENTS, SERVICE_TIMEOUT_MS, TICK_INTERVAL_MS};
 
 /// Handle to a running ENet server.
 ///
@@ -61,6 +61,8 @@ fn init_enet() {
 fn run_server(port: u16) {
     let host = create_host(port);
     let mut state = ServerState::default();
+    let mut last_tick = Instant::now();
+    let tick_interval = Duration::from_millis(TICK_INTERVAL_MS);
     tracing::info!("[ENET] listening on 0.0.0.0:{}", port);
 
     loop {
@@ -72,21 +74,26 @@ fn run_server(port: u16) {
             continue;
         }
 
-        if result == 0 || event.type_ == ENET_EVENT_TYPE_NONE {
-            continue;
-        }
-
-        match event.type_ {
-            ENET_EVENT_TYPE_CONNECT => state.on_connect(event.peer),
-            ENET_EVENT_TYPE_RECEIVE => {
-                state.on_receive(event.peer, event.channelID, event.packet);
-                unsafe { enet_packet_destroy(event.packet) };
+        if result > 0 && event.type_ != ENET_EVENT_TYPE_NONE {
+            match event.type_ {
+                ENET_EVENT_TYPE_CONNECT => state.on_connect(event.peer),
+                ENET_EVENT_TYPE_RECEIVE => {
+                    state.on_receive(event.peer, event.channelID, event.packet);
+                    unsafe { enet_packet_destroy(event.packet) };
+                }
+                ENET_EVENT_TYPE_DISCONNECT => state.on_disconnect(event.peer),
+                other => tracing::debug!("[ENET] ignored event type={}", other),
             }
-            ENET_EVENT_TYPE_DISCONNECT => state.on_disconnect(event.peer),
-            other => tracing::debug!("[ENET] ignored event type={}", other),
+
+            unsafe { enet_host_flush(host) };
         }
 
-        unsafe { enet_host_flush(host) };
+        // Tick: periodic frame sync
+        if last_tick.elapsed() >= tick_interval {
+            // fku
+            state.sync_frame();
+            last_tick = Instant::now();
+        }
     }
 }
 
