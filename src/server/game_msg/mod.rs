@@ -27,14 +27,24 @@ impl crate::server::state::ServerState {
                 self.handle_player_state(peer_key, game_msg);
             }
 
+            // Handle level revoke
+            GameMsgId::NetLevelDataRevoke => {
+                self.handle_level_revoke(peer_key, game_msg);
+            }
+
+            // Handle level data
+            GameMsgId::NetLevelData => {
+                self.handle_level_data(peer_key, game_msg);
+            }
+
             // SnapshotAck, really ack?
             GameMsgId::SnapshotAck => {
                 self.handle_snapshot_ack(peer_key, game_msg);
             }
 
-            // try handle level data
-            GameMsgId::NetLevelDataElect => {
-                self.handle_level_elect(peer_key, game_msg);
+            // so those msg need be forward to same level
+            GameMsgId::Critters | GameMsgId::MusicSync | GameMsgId::NetLevelDataElect => {
+                self.relay_game_msg(game_msg.msg_id, &game_msg.payload, peer_key);
             }
 
             // fuck u I don't known how to process this msg

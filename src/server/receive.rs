@@ -53,8 +53,8 @@ impl ServerState {
             e.send(0, &left, true);
         }
 
-        if self.level_hosts.get(&entry.level_id) == Some(&entry.player_id) {
-            self.level_hosts.remove(&entry.level_id);
+        if self.level_authority.get(&entry.level_id) == Some(&entry.player_id) {
+            self.level_authority.remove(&entry.level_id);
         }
     }
 

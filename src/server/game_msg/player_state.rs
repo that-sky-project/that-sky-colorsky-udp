@@ -18,29 +18,25 @@ impl crate::server::state::ServerState {
         let save_seq = msg.payload[0];
         let base_seq = msg.payload[1];
         let checksum = msg.payload[2];
-        let raw_state = peer.snap_reader.apply_delta(&msg.payload)?;
+        let raw_state = peer.player_delta.snap_reader.apply_delta(&msg.payload)?;
 
-        // Immediately reply to the sender with SnapshotAck (ack sequence number = saveSeq).
+        // ack will reply by tick
         if save_seq != 0 {
-            let ack = Packet::build_packet(
-                protocol::packet::PacketId::GameMsg,
-                &[GameMsgId::SnapshotAck.to_u8(), peer.lv_seq, 0, save_seq, 1],
-            );
-            peer.send(0, &ack, true);
+            peer.player_delta.snapshot_ack = Some(save_seq);
         }
 
-        peer.player_state_raw.clear();
-        peer.player_state_raw.extend(raw_state);
+        peer.player_delta.raw_state.clear();
+        peer.player_delta.raw_state.extend(raw_state);
 
         Some(())
     }
 
-    pub(crate) fn sync_frame(&mut self) -> Option<()> {
+    pub(crate) fn sync_frame(&mut self) {
         let all_entry: Vec<(u8, u32, Vec<u8>)> = self
             .peers
             .values()
-            .filter(|pr| !(pr.player_state_raw.is_empty()))
-            .map(|pr| (pr.player_id, pr.level_id, pr.player_state_raw.clone()))
+            .filter(|pr| !(pr.player_delta.raw_state.is_empty()))
+            .map(|pr| (pr.player_id, pr.level_id, pr.player_delta.raw_state.clone()))
             .collect();
 
         for peer in self.peers.values_mut() {
@@ -60,7 +56,7 @@ impl crate::server::state::ServerState {
             if entry.is_empty() {
                 continue;
             }
-            let snap = peer.snap_writer.generate_delta(&entry);
+            let snap = peer.player_delta.snap_writer.generate_delta(&entry);
 
             let pack = Packet::build_packet(
                 protocol::packet::PacketId::GameMsg,
@@ -69,7 +65,5 @@ impl crate::server::state::ServerState {
 
             peer.send(0, &pack, true);
         }
-
-        Some(())
     }
 }

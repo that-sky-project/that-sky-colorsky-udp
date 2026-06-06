@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 
+use crate::protocol::game_msg::level_data::LevelData;
+
 use super::peer::PeerEntry;
 
 /// Server-wide state shared across all connections.
@@ -16,7 +18,9 @@ pub struct ServerState {
     /// All connected peers, keyed by `peer as usize`.
     pub peers: HashMap<usize, PeerEntry>,
     /// Elected host player ID per level.
-    pub level_hosts: HashMap<u32, u8>,
+    pub level_authority: HashMap<u32, u8>,
+    /// Level Data.
+    pub levels_data: HashMap<u32, LevelData>,
 }
 
 impl ServerState {}

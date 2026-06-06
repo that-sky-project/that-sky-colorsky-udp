@@ -33,4 +33,16 @@ impl crate::server::state::ServerState {
 
         Some(())
     }
+
+    /// send a game msg to target player with peer_key
+    pub(super) fn send_msg_to(&self, msg: GameMsg, to: usize) -> Option<()> {
+        let payload =
+            Packet::build_packet(protocol::packet::PacketId::GameMsg, &msg.build_game_msg());
+
+        let peer = self.peers.get(&to)?;
+
+        peer.send(0, &payload, true);
+
+        Some(())
+    }
 }

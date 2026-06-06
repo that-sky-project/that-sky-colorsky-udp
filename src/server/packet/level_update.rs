@@ -1,12 +1,11 @@
 use crate::protocol;
 use crate::protocol::packet::Packet;
-use crate::utils::hex_preview;
 
 impl crate::server::state::ServerState {
     pub(super) fn handle_level_update(&mut self, peer_key: usize, payload: &[u8]) -> Option<()> {
         let peer = self.peers.get_mut(&peer_key)?;
 
-        // echo level updata packet will increase it
+        // each level updata packet will increase it
         peer.lv_seq += 1;
 
         let level_bytes = payload.get(14..18)?;
@@ -35,7 +34,15 @@ impl crate::server::state::ServerState {
             // Notify players in both the old and new levels.
             self.broadcast_same_level_without(0, &player_change_level, true, old_level, player_id);
             self.broadcast_same_level_without(0, &player_change_level, true, new_level, player_id);
+
+            // if the authority change level
+            // remove it from old level
+            if player_id == self.level_authority.get(&old_level).copied().unwrap_or(0) {
+                self.level_authority.remove(&old_level);
+            }
         }
+
+        self.send_elect_to(peer_key);
 
         Some(())
     }

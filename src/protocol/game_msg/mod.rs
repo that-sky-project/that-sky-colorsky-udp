@@ -17,6 +17,7 @@
 ///  - `level_seq` — The level change sequence number.
 ///  - `source_player` — The player id of the original sender.
 ///  - `payload` — The payload bytes.
+pub mod level_data;
 
 #[derive(Debug)]
 pub struct GameMsg {
@@ -104,7 +105,7 @@ pub enum GameMsgId {
     /// ```
     PlayerState = 3,
 
-    ///
+    /// forward it to same level
     Critters = 4,
 
     ///
@@ -149,6 +150,9 @@ pub enum GameMsgId {
 
     ///
     Metrics = 16,
+
+    /// forward it to same level
+    NetLevelElectionNominee = 17,
 
     ///
     AudienceHint = 19,

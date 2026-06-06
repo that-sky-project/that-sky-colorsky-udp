@@ -1,3 +1,5 @@
+#![allow(unused)]
+
 impl crate::server::state::ServerState {
     /// Broadcast data to all in-game peers in the same level, optionally
     /// excluding a specific peer.

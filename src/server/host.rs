@@ -92,6 +92,8 @@ fn run_server(port: u16) {
         if last_tick.elapsed() >= tick_interval {
             // fku
             state.sync_frame();
+            state.sync_level();
+            state.snapshot_ack();
             last_tick = Instant::now();
         }
     }

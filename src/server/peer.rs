@@ -11,6 +11,44 @@ use enet_sys::ENetPeer;
 use crate::protocol::types::TgcUuid;
 use crate::utils::snapshot::{SnapshotReader, SnapshotWriter};
 
+/// Player State
+pub struct PlayerState {
+    pub raw_state: Vec<u8>,
+    pub snap_reader: SnapshotReader,
+    pub snap_writer: SnapshotWriter,
+    pub snapshot_ack: Option<u8>,
+}
+
+impl PlayerState {
+    fn new() -> Self {
+        Self {
+            raw_state: Vec::new(),
+            snap_reader: SnapshotReader::new(),
+            snap_writer: SnapshotWriter::new(),
+            snapshot_ack: None,
+        }
+    }
+}
+
+/// Level Data
+pub struct LevelDelta {
+    pub raw_state: Vec<u8>,
+    pub snap_reader: SnapshotReader,
+    pub snap_writer: SnapshotWriter,
+    pub snapshot_ack: Option<u8>,
+}
+
+impl LevelDelta {
+    fn new() -> Self {
+        Self {
+            raw_state: Vec::new(),
+            snap_reader: SnapshotReader::new(),
+            snap_writer: SnapshotWriter::new(),
+            snapshot_ack: None,
+        }
+    }
+}
+
 /// Full state the server maintains for each ENet connection.
 pub struct PeerEntry {
     /// Raw ENet peer pointer, used to send data to this peer.
@@ -28,14 +66,10 @@ pub struct PeerEntry {
     /// Connection magic prefix (4 bytes) used to identify packets from
     /// different client sessions.
     pub conn_magic: [u8; 4],
-    /// Raw player state
-    pub player_state_raw: Vec<u8>,
-    /// Client->Server
-    /// SnapshotReader
-    pub snap_reader: SnapshotReader,
-    /// Server->Client
-    /// SnapshotWriter
-    pub snap_writer: SnapshotWriter,
+    /// Player State
+    pub player_delta: PlayerState,
+    /// Level Data
+    pub level_delta: LevelDelta,
 }
 
 impl PeerEntry {
@@ -49,9 +83,8 @@ impl PeerEntry {
             lv_seq: 0,
             connected_at: Instant::now(),
             conn_magic: [0; 4],
-            player_state_raw: Vec::new(),
-            snap_reader: SnapshotReader::new(),
-            snap_writer: SnapshotWriter::new(),
+            player_delta: PlayerState::new(),
+            level_delta: LevelDelta::new(),
         }
     }
 
