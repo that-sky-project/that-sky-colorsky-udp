@@ -126,7 +126,12 @@ pub enum GameMsgId {
     /// ```
     NetLevelDataElect = 8,
 
+    /// Send by client to revoke the net level data of a player.
     ///
+    /// ## Header
+    /// ```text
+    /// [player_id: u8] [level_id: u32]
+    /// ```
     NetLevelDataRevoke = 9,
 
     ///

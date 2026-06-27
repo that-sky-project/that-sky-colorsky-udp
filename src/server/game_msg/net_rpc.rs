@@ -15,8 +15,6 @@ impl crate::server::state::ServerState {
     pub(super) fn handle_net_rpc(&mut self, peer_key: usize, msg: GameMsg) -> Option<()> {
         // send to all
         tracing::debug!("[NET_RPC] hex={}", hex_preview(&msg.payload, 64));
-        self.relay_game_msg(GameMsgId::NetRpc, &msg.payload, peer_key);
-
-        Some(())
+        self.relay_game_msg(GameMsgId::NetRpc, &msg.payload, peer_key)
     }
 }

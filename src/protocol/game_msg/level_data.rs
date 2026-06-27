@@ -56,11 +56,11 @@ impl LevelData {
         let data = buf[size_of::<LevelDataHeader>()..].to_vec();
 
         // Verify the length is right
-        // if header.length as usize != data.len() {
-        // let len = header.length;
-        // println!("header.len={}, data.len={}", len, data.len());
-        // return None;
-        // }
+        if header.length as usize != data.len() {
+            let len = header.length;
+            println!("header.len={}, data.len={}", len, data.len());
+            return None;
+        }
         header.length = data.len() as u16;
 
         Some(Self { header, data })
@@ -91,5 +91,24 @@ impl LevelData {
         self.header.elected_player = elected_player;
         self.data = data.data.clone();
         Some(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::utils::hex_preview;
+
+    use super::*;
+    #[test]
+    fn from_bytes() {
+        let bytes = [];
+
+        let level_data = LevelData::from_bytes(&bytes);
+
+        println!(
+            "{}",
+            hex_preview(&LevelData::new(0xe8, 0x30b82314, 0, &[]).to_bytes(), 64)
+        );
+        println!("{:?}", level_data);
     }
 }

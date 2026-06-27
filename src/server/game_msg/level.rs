@@ -17,7 +17,7 @@ use crate::{
 };
 
 impl crate::server::state::ServerState {
-    /// Handles player state
+    /// Handles Level data
     pub(super) fn handle_level_data(&mut self, peer_key: usize, msg: GameMsg) -> Option<()> {
         let peer = self.peers.get_mut(&peer_key)?;
 
@@ -79,7 +79,7 @@ impl crate::server::state::ServerState {
         Some(())
     }
 
-    /// Sync level data
+    /// Sync level data, this function will called by server tick
     pub(crate) fn sync_level(&mut self) -> Option<()> {
         for peer in self.peers.values_mut() {
             if peer.player_id == *self.level_authority.get(&peer.level_id)? {
@@ -87,7 +87,7 @@ impl crate::server::state::ServerState {
             }
             let level_id = peer.level_id;
             if let Some(level_data) = self.levels_data.get(&level_id) {
-                tracing::debug!(
+                tracing::info!(
                     "level state hex={}",
                     hex_preview(&level_data.to_bytes(), level_data.to_bytes().len())
                 );

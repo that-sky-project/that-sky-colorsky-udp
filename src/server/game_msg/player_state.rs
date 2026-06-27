@@ -31,6 +31,7 @@ impl crate::server::state::ServerState {
         Some(())
     }
 
+    // Sync Player State frame, this function will called by server tick
     pub(crate) fn sync_frame(&mut self) {
         let all_entry: Vec<(u8, u32, Vec<u8>)> = self
             .peers

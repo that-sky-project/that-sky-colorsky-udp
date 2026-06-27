@@ -11,7 +11,7 @@ use crate::{
 };
 
 impl crate::server::state::ServerState {
-    /// Handles incoming game messages from a peer.
+    /// Handles snapshot ack
     pub(super) fn handle_snapshot_ack(&mut self, peer_key: usize, msg: GameMsg) -> Option<()> {
         let peer = self.peers.get_mut(&peer_key)?;
 
@@ -26,6 +26,7 @@ impl crate::server::state::ServerState {
         Some(())
     }
 
+    // This function will called by server tick
     pub(crate) fn snapshot_ack(&mut self) {
         let acks: Vec<(usize, u8, [u8; 2])> = self
             .peers
