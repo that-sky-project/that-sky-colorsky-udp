@@ -3,7 +3,7 @@
 //! Handles library initialization, host creation, the main event loop,
 //! and CRC32 checksum verification.
 
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::SocketAddr;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -29,14 +29,14 @@ pub struct EnetServer {
 }
 
 impl EnetServer {
-    /// Start the ENet server on the given port.
+    /// Start the ENet server bound to the given address.
     ///
     /// Spawns the event loop on a new thread and returns immediately.
-    pub fn start(port: u16) -> Self {
+    pub fn start(addr: SocketAddr) -> Self {
         init_enet();
-        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port));
-        thread::spawn(move || run_server(port));
-        Self { addr }
+        let server_addr = addr;
+        thread::spawn(move || run_server(server_addr));
+        Self { addr: server_addr }
     }
 }
 
@@ -58,12 +58,12 @@ fn init_enet() {
 /// | `CONNECT` | `state.on_connect(peer)` |
 /// | `RECEIVE` | `state.on_receive(peer, chan, packet)` |
 /// | `DISCONNECT` | `state.on_disconnect(peer)` |
-fn run_server(port: u16) {
-    let host = create_host(port);
+fn run_server(addr: SocketAddr) {
+    let host = create_host(addr);
     let mut state = ServerState::default();
     let mut last_tick = Instant::now();
     let tick_interval = Duration::from_millis(TICK_INTERVAL_MS);
-    tracing::info!("[ENET] listening on 0.0.0.0:{}", port);
+    tracing::info!("[ENET] listening on {}", addr);
 
     loop {
         let mut event = unsafe { std::mem::zeroed::<ENetEvent>() };
@@ -102,14 +102,18 @@ fn run_server(port: u16) {
 /// Create and configure an ENet host bound to `port`.
 ///
 /// Enables CRC32 checksum on every packet via [`enet_crc32_checksum`].
-fn create_host(port: u16) -> *mut ENetHost {
+fn create_host(addr: SocketAddr) -> *mut ENetHost {
+    let host_ip: u32 = match addr.ip() {
+        std::net::IpAddr::V4(v4) if !v4.is_unspecified() => u32::from_ne_bytes(v4.octets()),
+        std::net::IpAddr::V4(_) | std::net::IpAddr::V6(_) => ENET_HOST_ANY,
+    };
     let address = ENetAddress {
-        host: ENET_HOST_ANY,
-        port,
+        host: host_ip,
+        port: addr.port(),
     };
     let host = unsafe { enet_host_create(&address, MAX_CLIENTS, CHANNEL_COUNT, 0, 0) };
     if host.is_null() {
-        panic!("failed to create ENet host on port {}", port);
+        panic!("failed to create ENet host on {}", addr);
     }
     unsafe {
         (*host).checksum = Some(enet_crc32_checksum);
