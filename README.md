@@ -5,11 +5,31 @@ with CRC32 packet checksums.
 
 ## Quick Start
 
+Install Rust and add build dependencies 
+
+#### Ubuntu
+```bash
+sudo apt update
+sudo apt install build-essential clang cmake
+```
+
+#### Archlinux
+```bash
+pacman -S base-devel clang cmake
+```
+
+#### Termux
+```bash
+apt update
+apt install rust cmake
+```
+
+
 ```bash
 # Build
 cargo build --release
 
-# Run with defaults (0.0.0.0:9999)
+# Run with defaults (0.0.0.0:5413)
 cargo run --release
 
 # Custom host & port
@@ -26,7 +46,7 @@ cargo run --release -- -c path/to/config.toml
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--host <IP>` | IP address to bind to | `0.0.0.0` |
-| `--port <PORT>` | Port to listen on | `9999` |
+| `--port <PORT>` | Port to listen on | `5413` |
 | `-c`, `--config <PATH>` | Path to config file | `./config.toml` (if present) |
 
 Priority: **CLI arguments > config file > built-in defaults**.
