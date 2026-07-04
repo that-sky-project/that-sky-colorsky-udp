@@ -1,6 +1,5 @@
 use crate::protocol;
 use crate::protocol::packet::Packet;
-use crate::utils::fnv1a_player_id;
 
 impl crate::server::state::ServerState {
     /// Handles incoming game messages from a peer.
@@ -23,7 +22,13 @@ impl crate::server::state::ServerState {
             level_id
         );
 
-        let player_id = fnv1a_player_id(&tgc_uuid.raw());
+        // Derive a new player ID.
+        if self.net_id_count == 0 {
+            self.net_id_count = 1;
+        }
+        let player_id = self.net_id_count;
+        self.net_id_count = self.net_id_count.wrapping_add(1);
+
         peer.player_id = player_id;
         peer.uuid = tgc_uuid;
         peer.level_id = level_id;

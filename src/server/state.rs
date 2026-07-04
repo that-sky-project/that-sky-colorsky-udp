@@ -17,6 +17,8 @@ use super::peer::PeerEntry;
 pub struct ServerState {
     /// All connected peers, keyed by `peer as usize`.
     pub peers: HashMap<usize, PeerEntry>,
+    /// Count player id.
+    pub net_id_count: u8,
     /// Elected host player ID per level.
     pub level_authority: HashMap<u32, u8>,
     /// Level Data.
