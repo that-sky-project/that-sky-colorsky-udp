@@ -24,7 +24,7 @@ impl PlayerState {
         Self {
             raw_state: Vec::new(),
             snap_reader: SnapshotReader::new(),
-            snap_writer: SnapshotWriter::new(),
+            snap_writer: SnapshotWriter::new_unacked(),
             snapshot_ack: None,
         }
     }
@@ -43,7 +43,7 @@ impl LevelDelta {
         Self {
             raw_state: Vec::new(),
             snap_reader: SnapshotReader::new(),
-            snap_writer: SnapshotWriter::new(),
+            snap_writer: SnapshotWriter::new_unacked(),
             snapshot_ack: None,
         }
     }

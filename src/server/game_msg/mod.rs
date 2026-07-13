@@ -16,6 +16,12 @@ impl crate::server::state::ServerState {
         peer_key: usize,
         game_msg: protocol::game_msg::GameMsg,
     ) {
+        // Force sync lv seq
+        let peer = self.peers.get_mut(&peer_key);
+        if let Some(peer) = peer {
+            peer.lv_seq = game_msg.level_seq;
+        }
+
         match game_msg.msg_id {
             // NetRpc (now we just forward it to all players)
             GameMsgId::NetRpc => {

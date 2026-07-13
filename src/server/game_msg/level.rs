@@ -87,7 +87,7 @@ impl crate::server::state::ServerState {
             }
             let level_id = peer.level_id;
             if let Some(level_data) = self.levels_data.get(&level_id) {
-                tracing::info!(
+                tracing::debug!(
                     "level state hex={}",
                     hex_preview(&level_data.to_bytes(), level_data.to_bytes().len())
                 );
@@ -144,7 +144,7 @@ impl crate::server::state::ServerState {
 
         let msg = GameMsg::new(GameMsgId::NetLevelDataElect, peer.lv_seq, 0, &snap);
 
-        tracing::info!(
+        tracing::debug!(
             "[ENET:LEVEL_ECLECT] send to {}, level data header={:?}",
             peer.player_id,
             level_data.header
