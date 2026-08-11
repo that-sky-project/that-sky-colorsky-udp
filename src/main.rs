@@ -80,7 +80,7 @@ fn resolve_addr(cli: &Cli) -> SocketAddr {
         .config
         .as_ref()
         .or_else(|| default_config.exists().then_some(&default_config))
-        .and_then(|path| load_config(path));
+        .and_then(load_config);
 
     let host: String = cli
         .host
@@ -93,9 +93,7 @@ fn resolve_addr(cli: &Cli) -> SocketAddr {
         .or_else(|| config.as_ref().map(|c| c.server.port))
         .unwrap_or_else(default_port);
 
-    let ip: IpAddr = host
-        .parse()
-        .unwrap_or_else(|_| IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    let ip: IpAddr = host.parse().unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
 
     SocketAddr::new(ip, port)
 }

@@ -61,7 +61,7 @@ impl crate::server::state::ServerState {
             .filter(|pr| pr.level_id == peer.level_id && pr.player_id != peer.player_id)
             .collect::<Vec<_>>();
 
-        if let Some(next) = next.iter().next() {
+        if let Some(next) = next.first() {
             self.level_authority.insert(peer.level_id, next.player_id);
         }
 
@@ -72,9 +72,9 @@ impl crate::server::state::ServerState {
     pub(super) fn handle_level_heart_beat(&mut self, peer_key: usize, msg: GameMsg) -> Option<()> {
         let peer = self.peers.get(&peer_key)?;
 
-        if self.level_authority.get(&peer.level_id).is_none() {
-            self.level_authority.insert(peer.level_id, peer.player_id);
-        }
+        self.level_authority
+            .entry(peer.level_id)
+            .or_insert(peer.player_id);
 
         Some(())
     }
