@@ -46,7 +46,7 @@ impl crate::server::state::ServerState {
     ///
     /// Only sends to peers that have entered the game (`in_game == true`).
     pub(super) fn broadcast_all(&self, channel: u8, data: &[u8], reliable: bool) {
-        for e in self.peers.values() {
+        for e in self.peers.values().filter(|pr| pr.player_id != 0) {
             e.send(channel, data, reliable);
         }
     }

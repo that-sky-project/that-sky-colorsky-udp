@@ -38,7 +38,7 @@ impl crate::server::state::ServerState {
         let mut payload = Vec::with_capacity(1 + 37 * count);
 
         payload.push(count as u8);
-        for (_, peer) in self.peers.iter() {
+        for (_, peer) in self.peers.iter().filter(|(_, pr)| pr.player_id != 0) {
             payload.push(peer.player_id);
             payload.extend_from_slice(&peer.uuid.raw());
             payload.extend_from_slice(&[0u8; 16]);
