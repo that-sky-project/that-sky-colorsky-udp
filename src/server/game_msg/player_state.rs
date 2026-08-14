@@ -43,9 +43,7 @@ impl crate::server::state::ServerState {
         for peer in self.peers.values_mut() {
             let entry: Vec<u8> = all_entry
                 .iter()
-                .filter(|(player, level_id, _)| {
-                    *player != peer.player_id && *level_id == peer.level_id
-                })
+                .filter(|(player, level_id, _)| *player != peer.player_id)
                 .flat_map(|(id, _, state)| {
                     let mut buf = Vec::with_capacity(1 + 4 + state.len());
                     buf.push(*id);
