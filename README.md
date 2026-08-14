@@ -43,11 +43,11 @@ cargo run --release -- -c path/to/config.toml
 
 ### CLI Options
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--host <IP>` | IP address to bind to | `0.0.0.0` |
-| `--port <PORT>` | Port to listen on | `5413` |
-| `-c`, `--config <PATH>` | Path to config file | `./config.toml` (if present) |
+| Flag                    | Description           | Default                      |
+| ----------------------- | --------------------- | ---------------------------- |
+| `--host <IP>`           | IP address to bind to | `0.0.0.0`                    |
+| `--port <PORT>`         | Port to listen on     | `5413`                       |
+| `-c`, `--config <PATH>` | Path to config file   | `./config.toml` (if present) |
 
 Priority: **CLI arguments > config file > built-in defaults**.
 

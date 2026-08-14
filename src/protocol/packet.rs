@@ -139,7 +139,13 @@ pub enum PacketId {
 
     /// S->C.
     ///
-    /// *TODO: payload format unknown.*
+    /// ## Payload
+    ///
+    /// ```text
+    /// [unk_1: [u8; 32]] [move: Move] [unk_2: i32] [unk_3: u8] [unk_4: i32] [unk_5: bool] [uuid: player_uuid]
+    /// ```
+    /// The Move is a [`Move`](super::types::Move).
+    /// The UUID is a [`TgcUuid`](super::types::TgcUuid).
     MoveGame = 9,
 
     /// C->S.

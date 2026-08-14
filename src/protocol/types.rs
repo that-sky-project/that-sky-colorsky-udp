@@ -39,3 +39,32 @@ impl Debug for TgcUuid {
         write!(f, "{}", s)
     }
 }
+
+#[repr(C, packed)]
+pub struct Move {
+    address: u32,
+    port: u16,
+    unk_1: u64,
+    unk_2: u8,
+    player_cout: u32,
+    player_list: Vec<TgcUuid>,
+}
+
+impl Move {
+    pub fn new(address: u32, port: u16, player_list: Vec<TgcUuid>) -> Self {
+        Self {
+            address,
+            port,
+            unk_1: 0,
+            unk_2: 9,
+            player_cout: player_list.len() as u32,
+            player_list,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        unsafe {
+            std::slice::from_raw_parts(self as *const Self as *const u8, size_of::<Self>()).to_vec()
+        }
+    }
+}

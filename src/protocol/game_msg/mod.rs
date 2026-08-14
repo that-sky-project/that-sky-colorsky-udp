@@ -137,10 +137,29 @@ pub enum GameMsgId {
     ///
     NetLevelDataRevokeAck = 10,
 
+    /// NetLevelData uses [`snapshot`](crate::utils::snapshot) for compression.
+    /// So each msg have a snapshot header and payload
+    /// ## Header
+    /// ```text
+    /// [save_seq:u8] [base_seq:u8] [checksum:u8]
+    /// ```
     ///
+    /// LevelData only can send by authority of the level
+    /// ## Payload
+    ///
+    /// ```text
+    /// [level_data: LevelData]
+    /// ```
+    /// The level_data is [LevelData](level_data::LevelData)
     NetLevelData = 11,
 
+    /// Send by Client
     ///
+    /// ## Payload
+    ///
+    /// ```text
+    /// [unk_1: bool] [unk_2: u8] ] [level_id: u32] [unk_3: u16]
+    /// ```
     NetLevelDataHeartbeat = 12,
 
     /// SnapshotAck is used to confirm whether the snapshot has been accepted.
@@ -150,7 +169,7 @@ pub enum GameMsgId {
     /// ```
     SnapshotAck = 14,
 
-    ///
+    /// forward it to same level
     MusicSync = 15,
 
     ///
@@ -170,8 +189,9 @@ pub enum GameMsgId {
 
     ///
     AudienceChat = 22,
+
     ///
-    Unknown = 23,
+    Unknown1 = 23,
 
     ///
     AudienceSpotlightReq = 24,
@@ -197,7 +217,7 @@ impl GameMsgId {
             20 => Some(Self::AudienceSocialBroadcast),
             21 => Some(Self::AudienceConsensusVote),
             22 => Some(Self::AudienceChat),
-            23 => Some(Self::Unknown),
+            23 => Some(Self::Unknown1),
             24 => Some(Self::AudienceSpotlightReq),
             _ => None,
         }
