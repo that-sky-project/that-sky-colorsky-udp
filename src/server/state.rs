@@ -100,6 +100,8 @@ pub struct ServerState {
     pub migration_rosters: HashMap<String, MigrationRoster>,
     /// Optional event sink for control adapters and observability.
     pub event_tx: Option<EventSender>,
+    /// Reject new joins while draining (QWD node.drain).
+    pub draining: bool,
     /// Address the server is bound to (for status responses).
     pub bind_addr: String,
 }

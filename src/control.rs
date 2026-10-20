@@ -87,6 +87,8 @@ pub enum ControlCommand {
     RemoveRoom { room_id: String },
     /// Revoke the current level authority and elect another player.
     RevokeAuthority { level_id: u32, reason: u16 },
+    /// Stop accepting new players (QWD node draining).
+    SetDraining { draining: bool },
     /// Return a status snapshot.
     Status,
     /// Stop the server.
@@ -112,6 +114,14 @@ pub struct RoomInfo {
     pub players: usize,
 }
 
+/// Player summary used by status responses and adapters.
+#[derive(Debug, Clone)]
+pub struct PlayerInfo {
+    pub player_id: u8,
+    pub uuid: String,
+    pub level_id: u32,
+}
+
 /// Server status snapshot.
 #[derive(Debug, Clone)]
 pub struct ServerStatus {
@@ -119,7 +129,9 @@ pub struct ServerStatus {
     pub peers: usize,
     pub players: usize,
     pub pending_moves: usize,
+    pub draining: bool,
     pub rooms: Vec<RoomInfo>,
+    pub player_list: Vec<PlayerInfo>,
 }
 
 /// Response to a control command.
@@ -181,17 +193,20 @@ pub enum ServerEvent {
     MoveStarted {
         move_id: u64,
         player_id: u8,
+        player_uuid: TgcUuid,
         room_id: String,
     },
     MoveFinished {
         move_id: u64,
         player_id: u8,
+        player_uuid: TgcUuid,
         accepted: bool,
         result: u8,
     },
     MoveTimedOut {
         move_id: u64,
         player_id: u8,
+        player_uuid: TgcUuid,
     },
     AuthorityElected {
         level_id: u32,
@@ -332,6 +347,11 @@ impl ControlHandle {
         reason: u16,
     ) -> Result<ControlResponse, ControlError> {
         self.request(ControlCommand::RevokeAuthority { level_id, reason })
+    }
+
+    /// Start or stop accepting new players.
+    pub fn set_draining(&self, draining: bool) -> Result<ControlResponse, ControlError> {
+        self.request(ControlCommand::SetDraining { draining })
     }
 
     /// Fetch a status snapshot.

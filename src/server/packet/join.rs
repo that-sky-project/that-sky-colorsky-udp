@@ -28,6 +28,11 @@ impl ServerState {
             return None;
         }
 
+        if self.draining {
+            tracing::warn!(uuid = ?join.uuid, "rejected JoinGame: node is draining");
+            return None;
+        }
+
         if self
             .peers
             .iter()

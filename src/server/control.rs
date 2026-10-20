@@ -1,6 +1,6 @@
 //! Control command execution on the server thread.
 
-use crate::control::{ControlCommand, ControlResponse, ServerStatus};
+use crate::control::{ControlCommand, ControlResponse, PlayerInfo, ServerStatus};
 use crate::protocol::game_msg::{GameMsg, GameMsgId};
 use crate::protocol::packet::Packet;
 use crate::protocol::packet::PacketId;
@@ -43,6 +43,10 @@ impl ServerState {
             ControlCommand::RevokeAuthority { level_id, reason } => {
                 self.revoke_authority(level_id, reason)
             }
+            ControlCommand::SetDraining { draining } => {
+                self.draining = draining;
+                ControlResponse::Ok
+            }
             ControlCommand::Status => ControlResponse::Status(self.status()),
             ControlCommand::Shutdown => ControlResponse::Ok,
         }
@@ -55,7 +59,18 @@ impl ServerState {
             peers: self.peers.len(),
             players: self.peers.values().filter(|peer| peer.is_player()).count(),
             pending_moves: self.pending_moves.len(),
+            draining: self.draining,
             rooms: self.rooms.values().map(|room| room.to_info()).collect(),
+            player_list: self
+                .peers
+                .values()
+                .filter(|peer| peer.is_player())
+                .map(|peer| PlayerInfo {
+                    player_id: peer.player_id,
+                    uuid: format!("{:?}", peer.uuid),
+                    level_id: peer.level_id,
+                })
+                .collect(),
         }
     }
 
