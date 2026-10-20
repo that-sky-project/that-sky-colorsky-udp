@@ -30,10 +30,6 @@ struct Cli {
     /// Public UDP host:port reported to QWD (e.g. 203.0.113.10:5413)
     #[arg(long)]
     public_uri: Option<String>,
-
-    /// Stable room id reported to QWD (generated when omitted)
-    #[arg(long)]
-    room_id: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -71,8 +67,6 @@ struct QwdFileConfig {
     url: String,
     #[serde(default)]
     public_uri: String,
-    #[serde(default)]
-    room_id: String,
     #[serde(default = "default_capacity")]
     capacity: usize,
 }
@@ -168,25 +162,13 @@ fn resolve_config(cli: &Cli) -> ResolvedConfig {
             }
         };
 
-        let room_id = cli
-            .room_id
-            .clone()
-            .or_else(|| config.as_ref().map(|c| c.qwd.room_id.clone()))
-            .filter(|room_id| !room_id.trim().is_empty());
-
         let capacity = config
             .as_ref()
             .map(|c| c.qwd.capacity)
             .unwrap_or_else(default_capacity)
             .clamp(1, 8);
 
-        Some(QwdConfig::new(
-            qwd_url,
-            public_host,
-            public_port,
-            room_id,
-            capacity,
-        ))
+        Some(QwdConfig::new(qwd_url, public_host, public_port, capacity))
     };
 
     ResolvedConfig { addr, qwd }
@@ -252,7 +234,6 @@ fn main() {
     if let (Some(qwd), Some(events)) = (resolved.qwd, event_rx) {
         tracing::info!(
             qwd_url = %qwd.url,
-            room_id = %qwd.room_id,
             public = %format!("{}:{}", qwd.public_host, qwd.public_port),
             "QWD adapter enabled"
         );

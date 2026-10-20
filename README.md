@@ -71,8 +71,6 @@ port = 9999
 url = ""
 # UDP endpoint advertised to QWD. Must be reachable by clients.
 public_uri = "203.0.113.10:9999"
-# Optional stable room id; generated on startup when empty.
-room_id = ""
 capacity = 8
 ```
 
@@ -89,8 +87,10 @@ cargo run --release -- \
   --public-uri 203.0.113.10:5413
 ```
 
-CLI options `--qwd-url`, `--public-uri`, and `--room-id` override the config
-file. `public_uri` must be the exact UDP `host:port` clients can reach; colorsky
+CLI options `--qwd-url` and `--public-uri` override the config file. The node
+generates a random room id at startup; it is not configurable. On a room id
+conflict the node generates a new one and republishes `room.created`.
+`public_uri` must be the exact UDP `host:port` clients can reach; colorsky
 does not rewrite it through NAT.
 
 The adapter connects to the manager WebSocket (`/` with `?v=1`), reconnects

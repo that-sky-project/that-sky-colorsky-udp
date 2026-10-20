@@ -117,15 +117,8 @@ fn registers_and_answers_qwd_commands() {
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    let room_id = "11111111-1111-1111-1111-111111111111".to_string();
 
-    let mut config = QwdConfig::new(
-        format!("ws://127.0.0.1:{port}"),
-        "127.0.0.1",
-        5413,
-        Some(room_id.clone()),
-        8,
-    );
+    let mut config = QwdConfig::new(format!("ws://127.0.0.1:{port}"), "127.0.0.1", 5413, 8);
     config.reconnect_delay = Duration::from_secs(60);
 
     let _client = QwdClient::spawn(config, control, event_rx);
@@ -141,7 +134,9 @@ fn registers_and_answers_qwd_commands() {
         assert_eq!(ready["event"], "node.ready");
         let created = read_json(&mut socket);
         assert_eq!(created["event"], "room.created");
-        assert_eq!(created["data"]["roomId"], room_id);
+        let room_id = created["data"]["roomId"].as_str().unwrap().to_string();
+        assert_eq!(room_id.len(), 36);
+        assert_eq!(room_id.chars().filter(|ch| *ch == '-').count(), 4);
 
         // Force a few read timeouts before sending the first command; the
         // adapter must keep the socket usable after `WouldBlock`.
