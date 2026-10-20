@@ -14,7 +14,7 @@ impl crate::server::state::ServerState {
         reliable: bool,
     ) {
         for e in self.peers.values() {
-            if e.level_id != level_id {
+            if !e.is_active() || e.level_id != level_id {
                 continue;
             }
             e.send(channel, data, reliable);
@@ -32,7 +32,7 @@ impl crate::server::state::ServerState {
         except_player_id: u8,
     ) {
         for e in self.peers.values() {
-            if e.level_id != level_id {
+            if !e.is_active() || e.level_id != level_id {
                 continue;
             }
             if e.player_id == except_player_id {
@@ -46,7 +46,11 @@ impl crate::server::state::ServerState {
     ///
     /// Only sends to peers that have entered the game (`in_game == true`).
     pub(super) fn broadcast_all(&self, channel: u8, data: &[u8], reliable: bool) {
-        for e in self.peers.values().filter(|pr| pr.player_id != 0) {
+        for e in self
+            .peers
+            .values()
+            .filter(|pr| pr.player_id != 0 && pr.is_active())
+        {
             e.send(channel, data, reliable);
         }
     }
@@ -61,7 +65,7 @@ impl crate::server::state::ServerState {
         reliable: bool,
     ) {
         for e in self.peers.values() {
-            if e.player_id == except_player_id {
+            if !e.is_active() || e.player_id == except_player_id {
                 continue;
             }
             e.send(channel, data, reliable);

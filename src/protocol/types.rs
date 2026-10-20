@@ -6,7 +6,7 @@ use std::fmt::Debug;
 /// |type|note|
 /// |-|-|
 /// |[u8; 16]|A 16-bytes uuid.|
-#[derive(Clone, Copy, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Default, Eq, PartialEq, Hash)]
 pub struct TgcUuid([u8; 16]);
 
 impl TgcUuid {

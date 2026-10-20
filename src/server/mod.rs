@@ -9,6 +9,11 @@ pub mod packet;
 pub mod peer;
 pub mod receive;
 pub mod state;
+
+mod control;
+mod migration;
+mod moves;
+
 use std::sync::Once;
 
 /// Maximum concurrent clients (ENet host capacity).

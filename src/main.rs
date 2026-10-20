@@ -1,7 +1,5 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
-use std::thread;
-use std::time::Duration;
 
 use clap::Parser;
 use serde::Deserialize;
@@ -104,8 +102,10 @@ fn main() {
     let addr = resolve_addr(&cli);
 
     tracing::info!("starting server on {}", addr);
-    let _server = colorsky_udp::server::EnetServer::start(addr);
-    loop {
-        thread::sleep(Duration::from_secs(1));
-    }
+    let server = colorsky_udp::server::EnetServer::start(addr);
+    tracing::info!(
+        addr = %server.addr,
+        "control plane ready; use EnetServer::control() from an embedding application"
+    );
+    server.wait();
 }

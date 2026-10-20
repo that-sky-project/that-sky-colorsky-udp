@@ -9,7 +9,7 @@
 
 use enet_sys::{ENetPacket, ENetPeer};
 
-use super::peer::PeerEntry;
+use super::peer::{PeerEntry, PeerState};
 use super::state::ServerState;
 use crate::protocol::packet::{ClientPacket, Packet, PacketId};
 use crate::utils::hex_preview;
@@ -45,13 +45,24 @@ impl ServerState {
             entry.uuid,
             entry.level_id
         );
-        let left = Packet::build_packet(PacketId::PlayerLeft, &[entry.player_id, 0]);
-        for e in self.peers.values() {
-            e.send(0, &left, true);
-        }
 
-        if self.level_authority.get(&entry.level_id) == Some(&entry.player_id) {
-            self.level_authority.remove(&entry.level_id);
+        if entry.player_id != 0 {
+            self.forget_player_moves(entry.player_id);
+
+            let left = Packet::build_packet(PacketId::PlayerLeft, &[entry.player_id, 0]);
+            for remaining in self.peers.values().filter(|peer| peer.is_active()) {
+                remaining.send(0, &left, true);
+            }
+
+            self.release_authority(entry.player_id, entry.level_id);
+
+            if entry.state != PeerState::Closed {
+                self.emit_event(crate::control::ServerEvent::PlayerLeft {
+                    player_id: entry.player_id,
+                    uuid: entry.uuid,
+                    level_id: entry.level_id,
+                });
+            }
         }
     }
 

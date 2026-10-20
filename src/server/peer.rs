@@ -11,6 +11,20 @@ use enet_sys::ENetPeer;
 use crate::protocol::types::TgcUuid;
 use crate::utils::snapshot::{SnapshotReader, SnapshotWriter};
 
+/// Lifecycle state of one ENet connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PeerState {
+    /// Connected, but the client has not joined yet.
+    #[default]
+    Pending,
+    /// Joined and receiving room traffic.
+    Active,
+    /// MoveGame sent; only MoveResult/CancelMove are accepted.
+    Moving,
+    /// Kick or disconnect initiated.
+    Closed,
+}
+
 /// Player State
 pub struct PlayerState {
     pub raw_state: Vec<u8>,
@@ -61,6 +75,10 @@ pub struct PeerEntry {
     pub level_id: u32,
     /// Level sequence number, updated by LevelUpdate
     pub lv_seq: u8,
+    /// Client NetVersion (six u16 values).
+    pub net_version: [u16; 6],
+    /// Connection lifecycle state.
+    pub state: PeerState,
     /// Instant when the connection was established.
     pub connected_at: Instant,
     /// Connection token bound by the first `JoinGame` packet. Every later
@@ -81,6 +99,8 @@ impl PeerEntry {
             uuid: TgcUuid::default(),
             level_id: 0,
             lv_seq: 0,
+            net_version: [0; 6],
+            state: PeerState::Pending,
             connected_at: Instant::now(),
             conn_magic: None,
             player_delta: PlayerState::new(),
@@ -91,8 +111,8 @@ impl PeerEntry {
     /// Send data to this peer over ENet.
     ///
     /// `reliable` controls whether the packet is sent with the
-    /// `ENET_PACKET_FLAG_RELIABLE` flag.
-    pub fn send(&self, channel: u8, data: &[u8], reliable: bool) {
+    /// `ENET_PACKET_FLAG_RELIABLE` flag. Returns the ENet result code.
+    pub fn send(&self, channel: u8, data: &[u8], reliable: bool) -> i32 {
         unsafe {
             let flags = if reliable {
                 enet_sys::_ENetPacketFlag_ENET_PACKET_FLAG_RELIABLE as u32
@@ -100,7 +120,32 @@ impl PeerEntry {
                 0
             };
             let packet = enet_sys::enet_packet_create(data.as_ptr().cast(), data.len(), flags);
-            enet_sys::enet_peer_send(self.peer, channel, packet);
+            enet_sys::enet_peer_send(self.peer, channel, packet)
         }
+    }
+
+    /// Request a graceful ENet disconnect after queued packets are sent.
+    pub fn disconnect_later(&self, data: u32) {
+        unsafe {
+            enet_sys::enet_peer_disconnect_later(self.peer, data);
+        }
+    }
+
+    /// Whether the peer is joined and receiving room traffic.
+    pub fn is_active(&self) -> bool {
+        self.state == PeerState::Active
+    }
+
+    /// Whether the peer currently occupies a player slot.
+    pub fn is_player(&self) -> bool {
+        matches!(self.state, PeerState::Active | PeerState::Moving)
+    }
+
+    /// Whether the peer still holds its player id until ENet disconnects.
+    pub fn occupies_slot(&self) -> bool {
+        matches!(
+            self.state,
+            PeerState::Active | PeerState::Moving | PeerState::Closed
+        )
     }
 }

@@ -36,9 +36,10 @@ impl crate::server::state::ServerState {
             self.broadcast_same_level_without(0, &player_change_level, true, new_level, player_id);
 
             // if the authority change level
-            // remove it from old level
+            // remove it from old level and elect a replacement
             if player_id == self.level_authority.get(&old_level).copied().unwrap_or(0) {
                 self.level_authority.remove(&old_level);
+                self.rebalance_level(old_level);
             }
         }
 

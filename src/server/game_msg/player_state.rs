@@ -36,11 +36,14 @@ impl crate::server::state::ServerState {
         let all_entry: Vec<(u8, u32, Vec<u8>)> = self
             .peers
             .values()
-            .filter(|pr| !(pr.player_delta.raw_state.is_empty()))
+            .filter(|pr| pr.is_active() && !(pr.player_delta.raw_state.is_empty()))
             .map(|pr| (pr.player_id, pr.level_id, pr.player_delta.raw_state.clone()))
             .collect();
 
         for peer in self.peers.values_mut() {
+            if !peer.is_active() {
+                continue;
+            }
             let entry: Vec<u8> = all_entry
                 .iter()
                 .filter(|(player, level_id, _)| *player != peer.player_id)

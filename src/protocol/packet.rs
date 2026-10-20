@@ -29,6 +29,7 @@
 pub mod cancel_move;
 pub mod enter_game;
 pub mod join_game;
+pub mod kick;
 pub mod move_game;
 pub mod move_result;
 pub mod net_time;

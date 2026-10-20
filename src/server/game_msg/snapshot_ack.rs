@@ -38,6 +38,7 @@ impl crate::server::state::ServerState {
         let acks: Vec<(usize, u8, [u8; 2])> = self
             .peers
             .iter()
+            .filter(|(_, peer)| peer.is_active())
             .map(|(peer_key, peer)| {
                 (
                     *peer_key,

@@ -1,14 +1,46 @@
 use crate::protocol::{self, packet::PacketId};
+use crate::server::peer::PeerState;
 
 mod join;
 mod level_update;
-mod move_result;
 mod ping;
 mod utils;
 
 impl crate::server::state::ServerState {
     /// Handles incoming packets from a peer.
     pub(super) fn handle_packet(&mut self, peer_key: usize, packet: protocol::packet::Packet) {
+        let Some(peer) = self.peers.get(&peer_key) else {
+            return;
+        };
+
+        let allowed = match peer.state {
+            PeerState::Pending => {
+                matches!(
+                    packet.packet_id,
+                    PacketId::ClientConnect | PacketId::JoinGame
+                )
+            }
+            PeerState::Active => matches!(
+                packet.packet_id,
+                PacketId::LevelUpdate
+                    | PacketId::GameMsg
+                    | PacketId::NetTimePing
+                    | PacketId::MoveResult
+            ),
+            PeerState::Moving => matches!(packet.packet_id, PacketId::MoveResult),
+            PeerState::Closed => false,
+        };
+
+        if !allowed {
+            tracing::debug!(
+                player_id = peer.player_id,
+                state = ?peer.state,
+                packet_id = packet.packet_id.to_u8(),
+                "packet rejected by connection state"
+            );
+            return;
+        }
+
         // fuck, log the packet id
         // tracing::info!("[ENET:RX] packet={:?}", packet.packet_id as u8);
 

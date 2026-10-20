@@ -59,6 +59,61 @@ host = "0.0.0.0" # also you can use ipv6 with `::`
 port = 9999
 ```
 
+## Embedding & Control Plane
+
+The server can be embedded in a larger application. `EnetServer` exposes a
+cloneable `ControlHandle`; adapters (HTTP, WebSocket, QWD, CLI, ...) translate
+incoming requests into `ControlCommand` values. The library does not depend on
+any specific manager.
+
+```rust
+use colorsky_udp::control::RoomEndpoint;
+use colorsky_udp::protocol::net_address::NetAddress;
+use colorsky_udp::server::EnetServer;
+use std::net::{IpAddr, Ipv4Addr};
+
+fn main() {
+    let server = EnetServer::start("0.0.0.0:5413".parse().unwrap());
+    let control = server.control();
+
+    control
+        .upsert_room(RoomEndpoint::new(
+            "room-b",
+            NetAddress::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 5413),
+        ))
+        .unwrap();
+
+    // Player ids come from ServerEvent::PlayerJoined or your own registry.
+    let _ = control.move_player(1, "room-b");
+    let _ = control.status();
+
+    control.shutdown().unwrap();
+    server.wait();
+}
+```
+
+Supported commands:
+
+- `move_player`, `move_players` (atomic group), `move_level`
+- `cancel_move`
+- `kick_player`
+- `broadcast_rpc`
+- `upsert_room`, `remove_room`
+- `revoke_authority`
+- `status`, `shutdown`
+
+Events (player join/leave, move started/finished/timeout, authority elected)
+are available by starting with `EnetServer::start_with_events(addr, Some(tx))`.
+
+### Threading model
+
+The ENet host and peer pointers are owned by one server thread. Commands are
+sent through a bounded `std::sync::mpsc::sync_channel` and executed serially
+between ENet polls; the server never shares peer state behind a lock. This keeps
+ENet access single-threaded, preserves command ordering, and provides
+backpressure through `ControlError::QueueFull`. Synchronous callers use
+`ControlHandle::request` with a response channel and a five-second timeout.
+
 ## Build Requirements
 
 - Rust **1.85+** (edition 2024)

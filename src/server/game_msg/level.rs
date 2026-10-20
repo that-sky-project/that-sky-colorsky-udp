@@ -58,19 +58,23 @@ impl crate::server::state::ServerState {
 
     /// Handle level revoke
     pub(super) fn handle_level_revoke(&mut self, peer_key: usize, _msg: GameMsg) -> Option<()> {
-        let peer = self.peers.get(&peer_key)?;
-        if *self.level_authority.get(&peer.level_id)? == peer.player_id {
-            self.level_authority.remove(&peer.level_id);
+        let (level_id, player_id) = {
+            let peer = self.peers.get(&peer_key)?;
+            (peer.level_id, peer.player_id)
+        };
+
+        if self.level_authority.get(&level_id) == Some(&player_id) {
+            self.level_authority.remove(&level_id);
         }
 
         let next = self
             .peers
-            .values()
-            .filter(|pr| pr.level_id == peer.level_id && pr.player_id != peer.player_id)
-            .collect::<Vec<_>>();
+            .iter()
+            .find(|(key, peer)| **key != peer_key && peer.is_active() && peer.level_id == level_id)
+            .map(|(key, _)| *key);
 
-        if let Some(next) = next.first() {
-            self.level_authority.insert(peer.level_id, next.player_id);
+        if let Some(next_key) = next {
+            self.send_elect_to(next_key);
         }
 
         Some(())
@@ -122,7 +126,13 @@ impl crate::server::state::ServerState {
     /// Sync level data, this function will called by server tick
     pub(crate) fn sync_level(&mut self) -> Option<()> {
         for peer in self.peers.values_mut() {
-            if peer.player_id == *self.level_authority.get(&peer.level_id)? {
+            if !peer.is_active() {
+                continue;
+            }
+            let Some(authority) = self.level_authority.get(&peer.level_id) else {
+                continue;
+            };
+            if peer.player_id == *authority {
                 continue;
             }
             let level_id = peer.level_id;
