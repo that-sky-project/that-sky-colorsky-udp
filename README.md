@@ -3,6 +3,14 @@
 UDP game server for *Sky: Children of the Light*, built on [ENet](http://enet.bespin.org/)
 with CRC32 packet checksums.
 
+> **QWD branch.** This branch adds QWD (Hermes room manager) node support to
+> colorsky. The standalone server remains on
+> [`main`](https://github.com/that-sky-project/that-sky-colorsky-udp/tree/main).
+> The QWD manager lives in
+> [`that-sky-xysky-udp-room-authority`](https://github.com/that-sky-project/that-sky-xysky-udp-room-authority).
+>
+> [![QWD CI](https://github.com/that-sky-project/that-sky-colorsky-udp/actions/workflows/qwd.yml/badge.svg?branch=qwd)](https://github.com/that-sky-project/that-sky-colorsky-udp/actions/workflows/qwd.yml)
+
 ## Quick Start
 
 Install Rust and add build dependencies 
@@ -70,8 +78,10 @@ capacity = 8
 
 ### QWD node mode
 
-This branch includes the QWD (Hermes room manager) node adapter. Enable it by
-setting `qwd.url` or passing `--qwd-url`:
+This branch includes the QWD (Hermes room manager) node adapter. With
+`qwd.url` empty the server runs standalone. Set `qwd.url` or pass
+`--qwd-url` to register the node and let QWD allocate players and coordinate
+room moves:
 
 ```bash
 cargo run --release -- \
@@ -80,13 +90,45 @@ cargo run --release -- \
 ```
 
 CLI options `--qwd-url`, `--public-uri`, and `--room-id` override the config
-file. The adapter connects to the manager WebSocket (`/` with `?v=1`), sends
-`node.ready`, `room.created`, `player.join`/`player.leave`, `room.telemetry`
-and `move.result`, and handles `room.reserve`, `move.prepare`, `move.commit`,
-`move.cancel`, `player.redirect`, `node.drain`, `room.destroy` and
-`room.id_conflict`.
+file. `public_uri` must be the exact UDP `host:port` clients can reach; colorsky
+does not rewrite it through NAT.
 
-## Build Requirements
+The adapter connects to the manager WebSocket (`/` with `?v=1`), reconnects
+automatically, and reports:
+
+- `node.ready`, `room.created`
+- `player.join`, `player.leave`
+- `room.telemetry` once per second
+- `move.result` on failed or timed-out moves
+- `node.draining`, `room.destroyed`
+
+It handles these QWD commands and acknowledges each one:
+
+- `room.reserve`, `move.prepare`, `move.cancel`
+- `move.commit`, `player.redirect`
+- `node.drain`, `room.destroy`
+- `room.id_conflict`
+
+QWD reservations are counted against the eight-player room limit until the
+matching player joins or the reservation TTL expires. Room moves support single
+players, atomic groups and whole-level migration, including the migration
+roster on the destination node.
+
+#### Debugging a room move
+
+When QWD is started with an empty `debug.api_token`, its debug endpoints are
+available without a token:
+
+```bash
+# show rooms, nodes and players
+curl http://127.0.0.1:1131/debug/allnode
+
+# move every player from one room to another
+curl -X POST http://127.0.0.1:1131/debug/move \
+  -H 'content-type: application/json' \
+  -d '{"sourceRoomId":"<source>","targetRoomId":"<target>","playerIds":["<player>"],"reason":"manual"}'
+```
+
 ## Embedding & Control Plane
 
 The server can be embedded in a larger application. `EnetServer` exposes a
