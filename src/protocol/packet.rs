@@ -26,6 +26,10 @@
 //! - `net_player_id` — `u8`, derived from [`TgcUuid`](super::types::TgcUuid)
 //!   via `fnv1a_player_id`
 
+pub mod cancel_move;
+pub mod enter_game;
+pub mod join_game;
+pub mod move_game;
 pub mod move_result;
 pub mod net_time;
 
@@ -178,7 +182,7 @@ pub enum PacketId {
     /// ```text
     /// [unk_1: [u8; 32]] [move: Move] [unk_2: i32] [unk_3: u8] [unk_4: i32] [unk_5: bool] [uuid: player_uuid]
     /// ```
-    /// The Move is a [`Move`](super::types::Move).
+    /// The Move is a [`Move`](move_game::Move).
     /// The UUID is a [`TgcUuid`](super::types::TgcUuid).
     MoveGame = 9,
 
@@ -195,7 +199,13 @@ pub enum PacketId {
 
     /// S->C.
     ///
-    /// *TODO: payload format unknown.*
+    /// Cancels a pending move and returns the client to its current room.
+    ///
+    /// ## Payload
+    ///
+    /// ```text
+    /// [reason: u8] [payload: ...]
+    /// ```
     CancelMove = 11,
 
     /// C->S.

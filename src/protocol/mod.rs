@@ -24,5 +24,6 @@
 
 pub mod binary;
 pub mod game_msg;
+pub mod net_address;
 pub mod packet;
 pub mod types;

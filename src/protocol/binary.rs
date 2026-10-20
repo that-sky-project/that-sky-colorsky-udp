@@ -122,6 +122,114 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// Little-endian binary writer with LSB-first bit support.
+#[derive(Default)]
+pub struct Writer {
+    data: Vec<u8>,
+    bit_offset: u8,
+}
+
+impl Writer {
+    /// Create an empty writer.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Write an unsigned 8-bit integer.
+    pub fn write_u8(&mut self, value: u8) {
+        self.align_to_byte();
+        self.data.push(value);
+    }
+
+    /// Write a little-endian unsigned 16-bit integer.
+    pub fn write_u16(&mut self, value: u16) {
+        self.align_to_byte();
+        self.data.extend_from_slice(&value.to_le_bytes());
+    }
+
+    /// Write a little-endian unsigned 32-bit integer.
+    pub fn write_u32(&mut self, value: u32) {
+        self.align_to_byte();
+        self.data.extend_from_slice(&value.to_le_bytes());
+    }
+
+    /// Write a little-endian unsigned 64-bit integer.
+    pub fn write_u64(&mut self, value: u64) {
+        self.align_to_byte();
+        self.data.extend_from_slice(&value.to_le_bytes());
+    }
+
+    /// Write a little-endian `f32`.
+    pub fn write_f32(&mut self, value: f32) {
+        self.align_to_byte();
+        self.data.extend_from_slice(&value.to_le_bytes());
+    }
+
+    /// Write a little-endian `f64`.
+    pub fn write_f64(&mut self, value: f64) {
+        self.align_to_byte();
+        self.data.extend_from_slice(&value.to_le_bytes());
+    }
+
+    /// Write raw bytes after aligning to a byte boundary.
+    pub fn write_bytes(&mut self, bytes: &[u8]) {
+        self.align_to_byte();
+        self.data.extend_from_slice(bytes);
+    }
+
+    /// Write up to 32 bits, LSB-first.
+    pub fn write_bits(&mut self, value: u32, count: u8) {
+        let count = count.min(32);
+        let mask = if count == 32 {
+            u32::MAX
+        } else if count == 0 {
+            0
+        } else {
+            (1u32 << count) - 1
+        };
+        let value = value & mask;
+
+        for index in 0..count {
+            if self.bit_offset == 0 {
+                self.data.push(0);
+            }
+            if (value >> index) & 1 == 1
+                && let Some(last) = self.data.last_mut()
+            {
+                *last |= 1 << self.bit_offset;
+            }
+            self.bit_offset += 1;
+            if self.bit_offset == 8 {
+                self.bit_offset = 0;
+            }
+        }
+    }
+
+    /// Write a single packed boolean.
+    pub fn write_bool(&mut self, value: bool) {
+        self.write_bits(u32::from(value), 1);
+    }
+
+    /// Write a `SerializeCompressed(max)` value.
+    pub fn write_compressed(&mut self, value: u32, max: u32) -> Option<()> {
+        if value > max {
+            return None;
+        }
+        let bits = (32 - max.leading_zeros()) as u8;
+        self.write_bits(value, bits);
+        Some(())
+    }
+
+    /// Finish the buffer.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.data
+    }
+
+    fn align_to_byte(&mut self) {
+        self.bit_offset = 0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +273,31 @@ mod tests {
         assert_eq!(reader.remaining(), 2);
         assert_eq!(reader.read_u8(), Some(0x7f));
         assert_eq!(reader.read_u8(), Some(0xff));
+    }
+
+    #[test]
+    fn writer_matches_reader() {
+        let mut writer = Writer::new();
+        writer.write_bool(true);
+        writer.write_compressed(5, 8).unwrap();
+        writer.write_u8(0xaa);
+        writer.write_u16(0x1234);
+
+        let bytes = writer.into_bytes();
+        assert_eq!(bytes, vec![0b0000_1011, 0xaa, 0x34, 0x12]);
+
+        let mut reader = Reader::new(&bytes);
+        assert_eq!(reader.read_bool(), Some(true));
+        assert_eq!(reader.read_compressed(8), Some(5));
+        assert_eq!(reader.read_u8(), Some(0xaa));
+        assert_eq!(reader.read_u16(), Some(0x1234));
+    }
+
+    #[test]
+    fn writer_handles_trailing_partial_byte() {
+        let mut writer = Writer::new();
+        writer.write_bool(false);
+        writer.write_bool(true);
+        assert_eq!(writer.into_bytes(), vec![0b0000_0010]);
     }
 }
