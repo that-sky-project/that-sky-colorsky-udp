@@ -1,0 +1,207 @@
+//! QWD (Hermes room manager) node adapter.
+//!
+//! The adapter runs on its own thread, owns the QWD WebSocket and forwards
+//! commands to the ENet thread through [`ControlHandle`]. Incoming server
+//! events are converted into QWD `player.*`, `room.telemetry` and `move.result`
+//! messages.
+
+mod commands;
+mod events;
+mod protocol;
+mod reservations;
+mod util;
+
+use std::collections::{HashMap, HashSet};
+use std::io::ErrorKind;
+use std::net::TcpStream;
+use std::sync::mpsc::Receiver;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use serde_json::Value;
+use tungstenite::stream::MaybeTlsStream;
+use tungstenite::{Error as WsError, Message, WebSocket, connect};
+
+use crate::control::{ControlHandle, ControlResponse, ServerEvent, ServerStatus};
+
+use reservations::Reservations;
+use util::{control_error, endpoint_url, generate_room_id, init_tls, set_read_timeout};
+
+type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
+type AckParts = (i64, Option<String>, Option<Value>);
+
+/// QWD node configuration.
+#[derive(Debug, Clone)]
+pub struct QwdConfig {
+    pub url: String,
+    pub public_host: String,
+    pub public_port: u16,
+    pub room_id: String,
+    pub capacity: usize,
+    pub reconnect_delay: Duration,
+}
+
+impl QwdConfig {
+    /// Create a config, generating a room id when none is supplied.
+    pub fn new(
+        url: impl Into<String>,
+        public_host: impl Into<String>,
+        public_port: u16,
+        room_id: Option<String>,
+        capacity: usize,
+    ) -> Self {
+        let room_id = room_id
+            .filter(|room_id| !room_id.trim().is_empty())
+            .unwrap_or_else(generate_room_id);
+
+        Self {
+            url: url.into(),
+            public_host: public_host.into(),
+            public_port,
+            room_id,
+            capacity: capacity.clamp(1, 8),
+            reconnect_delay: Duration::from_secs(2),
+        }
+    }
+}
+
+/// Move state used to aggregate per-player results into one QWD event.
+#[derive(Debug)]
+struct PendingQwdMove {
+    pending: HashSet<u64>,
+    moved: Vec<String>,
+    failed: Vec<String>,
+    reason: Option<String>,
+}
+
+/// QWD node client. Use [`QwdClient::spawn`] to start it.
+pub struct QwdClient {
+    config: QwdConfig,
+    control: ControlHandle,
+    events: Receiver<ServerEvent>,
+    reservations: Reservations,
+    room_id: String,
+    room_version: u64,
+    telemetry_seq: u64,
+    draining: bool,
+    internal_to_qwd: HashMap<u64, String>,
+    qwd_moves: HashMap<String, PendingQwdMove>,
+}
+
+impl QwdClient {
+    /// Spawn the QWD client thread. It reconnects automatically.
+    pub fn spawn(
+        config: QwdConfig,
+        control: ControlHandle,
+        events: Receiver<ServerEvent>,
+    ) -> JoinHandle<()> {
+        thread::spawn(move || {
+            Self {
+                room_id: config.room_id.clone(),
+                config,
+                control,
+                events,
+                reservations: Reservations::default(),
+                room_version: 1,
+                telemetry_seq: 0,
+                draining: false,
+                internal_to_qwd: HashMap::new(),
+                qwd_moves: HashMap::new(),
+            }
+            .run();
+        })
+    }
+
+    fn run(mut self) {
+        loop {
+            match self.connect_once() {
+                Ok(()) => tracing::info!("[QWD] connection closed"),
+                Err(error) => tracing::warn!(error = %error, "[QWD] connection failed"),
+            }
+
+            self.reservations.clear();
+            self.internal_to_qwd.clear();
+            self.qwd_moves.clear();
+            while self.events.try_recv().is_ok() {}
+            thread::sleep(self.config.reconnect_delay);
+        }
+    }
+
+    fn connect_once(&mut self) -> Result<(), String> {
+        init_tls();
+        let endpoint = endpoint_url(&self.config.url)?;
+        let (mut socket, _) = connect(endpoint.as_str()).map_err(|error| error.to_string())?;
+        set_read_timeout(&mut socket, Some(Duration::from_millis(250)))
+            .map_err(|error| error.to_string())?;
+
+        tracing::info!(
+            endpoint = %endpoint,
+            room_id = %self.room_id,
+            "[QWD] connected"
+        );
+
+        self.reservations.clear();
+        self.internal_to_qwd.clear();
+        self.qwd_moves.clear();
+        self.room_version = 1;
+        self.telemetry_seq = 0;
+
+        self.send_node_ready(&mut socket)?;
+        self.send_room_created(&mut socket)?;
+        self.replay_players(&mut socket)?;
+        if self.draining {
+            self.send_node_draining(&mut socket)?;
+        }
+
+        let mut last_telemetry = Instant::now();
+
+        loop {
+            self.drain_events(&mut socket)?;
+
+            if last_telemetry.elapsed() >= Duration::from_secs(1) {
+                self.reservations.expire(Instant::now());
+                self.send_telemetry(&mut socket)?;
+                last_telemetry = Instant::now();
+            }
+
+            match socket.read() {
+                Ok(Message::Text(text)) => {
+                    self.handle_command(&mut socket, text.as_str())?;
+                }
+                Ok(Message::Binary(bytes)) => {
+                    tracing::warn!(bytes = bytes.len(), "[QWD] ignored binary message");
+                }
+                Ok(Message::Ping(payload)) => {
+                    socket
+                        .send(Message::Pong(payload))
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok(Message::Pong(_)) | Ok(Message::Close(_)) => {}
+                Ok(_) => {}
+                Err(WsError::Io(error))
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                Err(WsError::ConnectionClosed | WsError::AlreadyClosed) => return Ok(()),
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    }
+
+    pub(super) fn send_json(&self, socket: &mut Socket, value: &Value) -> Result<(), String> {
+        let text = serde_json::to_string(value).map_err(|error| error.to_string())?;
+        socket
+            .send(Message::text(text))
+            .map_err(|error| error.to_string())
+    }
+
+    pub(super) fn status(&self) -> Result<ServerStatus, String> {
+        match self.control.status() {
+            Ok(ControlResponse::Status(status)) => Ok(status),
+            Ok(ControlResponse::Error { message }) => Err(message),
+            Ok(_) => Err("unexpected status response".to_string()),
+            Err(error) => Err(control_error(error)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

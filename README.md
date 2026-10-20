@@ -57,8 +57,36 @@ Priority: **CLI arguments > config file > built-in defaults**.
 [server]
 host = "0.0.0.0" # also you can use ipv6 with `::`
 port = 9999
+
+[qwd]
+# Empty url disables the QWD adapter and runs standalone.
+url = ""
+# UDP endpoint advertised to QWD. Must be reachable by clients.
+public_uri = "203.0.113.10:9999"
+# Optional stable room id; generated on startup when empty.
+room_id = ""
+capacity = 8
 ```
 
+### QWD node mode
+
+This branch includes the QWD (Hermes room manager) node adapter. Enable it by
+setting `qwd.url` or passing `--qwd-url`:
+
+```bash
+cargo run --release -- \
+  --qwd-url wss://manager.example \
+  --public-uri 203.0.113.10:5413
+```
+
+CLI options `--qwd-url`, `--public-uri`, and `--room-id` override the config
+file. The adapter connects to the manager WebSocket (`/` with `?v=1`), sends
+`node.ready`, `room.created`, `player.join`/`player.leave`, `room.telemetry`
+and `move.result`, and handles `room.reserve`, `move.prepare`, `move.commit`,
+`move.cancel`, `player.redirect`, `node.drain`, `room.destroy` and
+`room.id_conflict`.
+
+## Build Requirements
 ## Embedding & Control Plane
 
 The server can be embedded in a larger application. `EnetServer` exposes a
