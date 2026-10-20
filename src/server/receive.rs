@@ -4,15 +4,15 @@
 //!   the peers table.
 //! - `on_disconnect` — Peer left: remove from peers, broadcast
 //!   `PlayerLeft`, clear host record if applicable.
-//! - `on_receive`    — Unified inbound path: strip connection magic,
-//!   parse, route by `packet_id`.
+//! - `on_receive`    — Unified inbound path: parse the client token,
+//!   validate it against the session, then route by `packet_id`.
 
 use enet_sys::{ENetPacket, ENetPeer};
 
 use super::peer::PeerEntry;
 use super::state::ServerState;
-use crate::protocol::{self, packet::Packet};
-use crate::utils::{hex_preview, strip_connection_magic};
+use crate::protocol::packet::{ClientPacket, Packet, PacketId};
+use crate::utils::hex_preview;
 
 impl ServerState {
     /// Handle a new ENet connection.
@@ -45,10 +45,7 @@ impl ServerState {
             entry.uuid,
             entry.level_id
         );
-        let left = Packet::build_packet(
-            protocol::packet::PacketId::PlayerLeft,
-            &[entry.player_id, 0],
-        );
+        let left = Packet::build_packet(PacketId::PlayerLeft, &[entry.player_id, 0]);
         for e in self.peers.values() {
             e.send(0, &left, true);
         }
@@ -62,8 +59,9 @@ impl ServerState {
     ///
     /// 1. Auto-register if the peer is not yet in the table (handles
     ///    out-of-order CONNECT / RECEIVE events).
-    /// 2. Strip the connection magic prefix and parse the packet.
-    /// 3. Dispatch to [`handle_packet`].
+    /// 2. Parse the 4-byte connection token plus packet header.
+    /// 3. Only `JoinGame` may establish the token; later packets must match.
+    /// 4. Dispatch to [`handle_packet`].
     pub(super) fn on_receive(
         &mut self,
         peer: *mut ENetPeer,
@@ -83,13 +81,44 @@ impl ServerState {
             self.on_connect(peer);
         }
 
-        let payload = strip_connection_magic(data, self.peers.get_mut(&key));
-
-        let Some(packet) = Packet::from(payload) else {
-            tracing::info!("[ENET:RX] unknown packet raw={}", hex_preview(data, 64));
+        let Some(client_packet) = ClientPacket::from(data) else {
+            tracing::info!(
+                "[ENET:RX] malformed client packet raw={}",
+                hex_preview(data, 64)
+            );
             return;
         };
 
-        self.handle_packet(key, packet);
+        let Some(entry) = self.peers.get_mut(&key) else {
+            return;
+        };
+
+        match entry.conn_magic {
+            // The first packet may only be JoinGame; its token becomes the
+            // session token. This mirrors XYSKY's connMagic handling.
+            None if client_packet.packet.packet_id != PacketId::JoinGame => {
+                tracing::warn!(
+                    player_id = entry.player_id,
+                    packet_id = client_packet.packet.packet_id.to_u8(),
+                    "rejected client packet before JoinGame"
+                );
+                return;
+            }
+            None => {
+                entry.conn_magic = Some(client_packet.token);
+            }
+            Some(expected) if expected != client_packet.token => {
+                tracing::warn!(
+                    player_id = entry.player_id,
+                    expected = expected,
+                    received = client_packet.token,
+                    "rejected client packet with mismatched connection token"
+                );
+                return;
+            }
+            Some(_) => {}
+        }
+
+        self.handle_packet(key, client_packet.packet);
     }
 }

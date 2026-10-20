@@ -8,8 +8,11 @@
 //! ### Client -> Server
 //!
 //! ```text
-//! [packet_id:u8] [seq:u8] [payload]
+//! [token:u32] [packet_id:u8] [seq:u8] [payload]
 //! ```
+//!
+//! The 4-byte token is bound to the session by the first `JoinGame` packet
+//! and must match on every subsequent packet (same contract as XYSKY).
 //!
 //! ### Server -> Client
 //!
@@ -27,6 +30,7 @@ pub mod move_result;
 pub mod net_time;
 
 /// Represents a parsed packet from the client or server.
+#[derive(Debug)]
 pub struct Packet {
     pub packet_id: PacketId,
     pub seq: u8,
@@ -34,11 +38,14 @@ pub struct Packet {
 }
 
 impl Packet {
-    /// Parse a raw packet into a `Packet` struct.
+    /// Parse an unprefixed packet (`packet_id + seq + payload`).
+    ///
+    /// Client traffic should use [`ClientPacket::from`], which also consumes
+    /// the 4-byte connection token.
     pub fn from(v: &[u8]) -> Option<Self> {
-        let packet_id = PacketId::from_u8(v[0])?;
-        let seq = v[1];
-        let payload = &v[2..];
+        let (&packet_id, rest) = v.split_first()?;
+        let packet_id = PacketId::from_u8(packet_id)?;
+        let (&seq, payload) = rest.split_first()?;
         Some(Self {
             packet_id,
             seq,
@@ -53,6 +60,30 @@ impl Packet {
         buf.extend(&(data.len() as u16).to_le_bytes());
         buf.extend(data);
         buf
+    }
+}
+
+/// A client packet prefixed with the 4-byte connection token.
+///
+/// ```text
+/// [token:u32 LE] [packet_id:u8] [seq:u8] [payload]
+/// ```
+#[derive(Debug)]
+pub struct ClientPacket {
+    pub token: u32,
+    pub packet: Packet,
+}
+
+impl ClientPacket {
+    /// Parse a client packet, including its connection token.
+    pub fn from(v: &[u8]) -> Option<Self> {
+        if v.len() < 6 {
+            return None;
+        }
+
+        let token = u32::from_le_bytes(v[..4].try_into().ok()?);
+        let packet = Packet::from(&v[4..])?;
+        Some(Self { token, packet })
     }
 }
 
@@ -260,5 +291,31 @@ mod tests {
         assert_eq!(PacketId::from_u8(15), None);
         assert_eq!(PacketId::from_u8(16), None);
         assert_eq!(PacketId::from_u8(18), None);
+    }
+
+    #[test]
+    fn parse_unprefixed_packet() {
+        let packet = Packet::from(&[3, 9, 0xaa, 0xbb]).unwrap();
+        assert_eq!(packet.packet_id, PacketId::JoinGame);
+        assert_eq!(packet.seq, 9);
+        assert_eq!(packet.payload, vec![0xaa, 0xbb]);
+
+        assert!(Packet::from(&[]).is_none());
+        assert!(Packet::from(&[3]).is_none());
+        assert!(Packet::from(&[15, 0]).is_none());
+    }
+
+    #[test]
+    fn parse_client_packet_with_token() {
+        let mut raw = 0x1234_5678u32.to_le_bytes().to_vec();
+        raw.extend([3, 9, 0xaa, 0xbb]);
+
+        let packet = ClientPacket::from(&raw).unwrap();
+        assert_eq!(packet.token, 0x1234_5678);
+        assert_eq!(packet.packet.packet_id, PacketId::JoinGame);
+        assert_eq!(packet.packet.seq, 9);
+        assert_eq!(packet.packet.payload, vec![0xaa, 0xbb]);
+
+        assert!(ClientPacket::from(&raw[..5]).is_none());
     }
 }

@@ -63,9 +63,9 @@ pub struct PeerEntry {
     pub lv_seq: u8,
     /// Instant when the connection was established.
     pub connected_at: Instant,
-    /// Connection magic prefix (4 bytes) used to identify packets from
-    /// different client sessions.
-    pub conn_magic: [u8; 4],
+    /// Connection token bound by the first `JoinGame` packet. Every later
+    /// client packet must carry the same token.
+    pub conn_magic: Option<u32>,
     /// Player State
     pub player_delta: PlayerState,
     /// Level Data
@@ -82,7 +82,7 @@ impl PeerEntry {
             level_id: 0,
             lv_seq: 0,
             connected_at: Instant::now(),
-            conn_magic: [0; 4],
+            conn_magic: None,
             player_delta: PlayerState::new(),
             level_delta: LevelDelta::new(),
         }

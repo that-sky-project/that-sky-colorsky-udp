@@ -10,8 +10,11 @@
 //! ### Client -> Server
 //!
 //! ```text
-//! [packet_id:u8] [seq:u8] [payload]
+//! [token:u32] [packet_id:u8] [seq:u8] [payload]
 //! ```
+//!
+//! The token is bound to the ENet connection by the first `JoinGame` and
+//! validated on every later packet.
 //!
 //! ### Server -> Client
 //!
