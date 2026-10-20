@@ -1,16 +1,32 @@
-// #![doc = include_str!("../../docs/snapshot.md")]
+//! Sky snapshot frame reader/writer.
+//!
+//! Wire format:
+//!
+//! ```text
+//! [save_seq: u8][base_seq: u8][checksum: u8][payload...]
+//! ```
+//!
+//! Frame kinds:
+//!
+//! - raw:      `save_seq != 0 && base_seq == 0` — full state, replaces the window
+//! - keyframe: `save_seq != 0 && base_seq != 0` — XOR-RLE diff against `base_seq`
+//! - delta:    `save_seq == 0 && base_seq != 0` — XOR-RLE diff, not stored
+//! - invalid:  both sequence numbers are zero
+//!
+//! Both sides start with an empty sequence-1 base. This lets the first server
+//! frame be a keyframe (`save_seq = 2, base_seq = 1`) rather than a raw frame,
+//! matching the current client snapshot implementation.
 
-/// Maximum state size in bytes. Larger states are truncated.
-const MAX_STATE_SIZE: usize = 7500;
-/// Maximum number of past frames kept in the sliding window.
+/// Maximum state size in bytes. Larger states are truncated when writing and
+/// rejected when reading.
+const MAX_STATE_SIZE: usize = 0x2100;
+/// Maximum number of past saved frames kept in the sliding window.
 const MAX_WINDOW: usize = 16;
-/// Emit a keyframe every N deltas to keep the client in sync.
-const KEYFRAME_INTERVAL: u8 = 10;
-/// Enter resync mode after this many unacknowledged frames.
-const MAX_MISSED_ACKS: u8 = 3;
+/// Emit a saved frame every N writes outside resync mode.
+const KEYFRAME_INTERVAL: usize = 10;
 
 /// A single entry in the snapshot sliding window.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct WindowEntry {
     /// Monotonic sequence number of this frame.
     pub sequence: u8,
@@ -22,116 +38,150 @@ pub struct WindowEntry {
 
 /// Client->Server snapshot decoder.
 ///
-/// Maintains a sliding window of recent frames and reconstructs full
-/// player state from incoming delta/key/raw frames.
+/// Maintains a sliding window of saved frames and reconstructs full state
+/// from incoming raw/keyframe/delta frames. Entries are ordered oldest-first.
 #[derive(Clone)]
 pub struct SnapshotReader {
-    /// Most recently decoded `save_seq`.
-    pub current_sequence: u8,
-    /// Sliding window of recent frames used as XOR bases.
-    pub window: Vec<WindowEntry>,
-    /// Latest fully reconstructed state.
-    pub latest_full_state: Vec<u8>,
-    /// When `true`, delta frames are ignored until a keyframe or raw
-    /// frame arrives.
+    /// Recent saved frames used as XOR bases.
+    window: Vec<WindowEntry>,
+    /// When `true`, deltas are ignored until a raw frame arrives.
     waiting_for_keyframe: bool,
 }
 
 impl SnapshotReader {
-    /// Create a new reader with an empty window.
+    /// Create a new reader seeded with the empty sequence-1 base.
     pub fn new() -> Self {
         Self {
-            current_sequence: 0,
-            window: Vec::with_capacity(MAX_WINDOW),
-            latest_full_state: Vec::new(),
+            window: vec![WindowEntry {
+                sequence: 1,
+                data: Vec::new(),
+            }],
             waiting_for_keyframe: false,
         }
     }
 
-    /// Apply an incoming delta/key/raw frame.
+    /// Most recently decoded `save_seq` (0 if none).
+    pub fn latest_sequence(&self) -> u8 {
+        self.window
+            .iter()
+            .rev()
+            .find(|entry| entry.sequence != 0)
+            .map(|entry| entry.sequence)
+            .unwrap_or(0)
+    }
+
+    /// Apply an incoming raw/keyframe/delta frame.
     ///
     /// Returns the reconstructed full state on success, or `None` if the
-    /// frame is malformed, fails checksum verification, or is a delta
-    /// while waiting for a keyframe.
+    /// frame is malformed, fails checksum verification, is a delta while
+    /// waiting for a keyframe, or references a base that is not available.
     pub fn apply_delta(&mut self, delta: &[u8]) -> Option<Vec<u8>> {
         if delta.len() < 3 {
             return None;
         }
+
         let save_seq = delta[0];
         let base_seq = delta[1];
         let expected = delta[2];
-        let data = &delta[3..];
+        let payload = &delta[3..];
 
-        // Raw frame: save_seq ≠ 0, base_seq = 0.
-        if base_seq == 0 && save_seq != 0 {
-            if snapshot_checksum(data) != expected {
-                return None;
-            }
-            let s = data.to_vec();
-            self.window.clear();
-            self.add_to_window(save_seq, s.clone());
-            self.current_sequence = save_seq;
-            self.latest_full_state = s.clone();
-            self.waiting_for_keyframe = false;
-            return Some(s);
+        if save_seq == 0 && base_seq == 0 {
+            tracing::debug!("[SNAPSHOT] ignore frame with zero save/base sequence");
+            return None;
         }
 
-        // Key or delta frame: base_seq ≠ 0.
-        if base_seq != 0 {
-            if self.waiting_for_keyframe && save_seq == 0 {
+        if snapshot_checksum(payload) != expected {
+            tracing::debug!(
+                "[SNAPSHOT] checksum mismatch saveSeq={} baseSeq={}",
+                save_seq,
+                base_seq
+            );
+            return None;
+        }
+
+        // Raw frame: replaces the whole window.
+        if base_seq == 0 {
+            if payload.len() > MAX_STATE_SIZE {
                 tracing::debug!(
-                    "[SNAPSHOT] ignore delta while waiting for keyframe baseSeq={}",
-                    base_seq
+                    "[SNAPSHOT] ignore oversized raw frame bytes={} max={}",
+                    payload.len(),
+                    MAX_STATE_SIZE
                 );
                 return None;
             }
 
-            if snapshot_checksum(data) != expected {
-                return None;
-            }
-            let xor_buf = rle_decode(data)?;
-            if xor_buf.len() > MAX_STATE_SIZE {
-                return None;
-            }
-            let base = self
-                .window
-                .iter()
-                .find(|e| e.sequence == base_seq)
-                .map(|e| e.data.as_slice())
-                .unwrap_or(&[]);
-            let mut new_state = vec![0u8; xor_buf.len()];
-            for i in 0..base.len().min(xor_buf.len()) {
-                new_state[i] = base[i] ^ xor_buf[i];
-            }
-            if xor_buf.len() > base.len() {
-                new_state[base.len()..].copy_from_slice(&xor_buf[base.len()..]);
-            }
-
-            // If save_seq ≠ 0, it's a keyframe — store in window.
-            if save_seq != 0 {
-                self.add_to_window(save_seq, new_state.clone());
-                self.current_sequence = save_seq;
-                self.waiting_for_keyframe = false;
-            }
-            self.latest_full_state = new_state.clone();
-            return Some(new_state);
+            let state = payload.to_vec();
+            self.window.clear();
+            self.add_to_window(save_seq, state.clone());
+            self.waiting_for_keyframe = false;
+            return Some(state);
         }
-        None
+
+        if self.waiting_for_keyframe && save_seq == 0 {
+            tracing::debug!(
+                "[SNAPSHOT] ignore delta while waiting for keyframe baseSeq={}",
+                base_seq
+            );
+            return None;
+        }
+
+        let Some(base) = self
+            .window
+            .iter()
+            .find(|entry| entry.sequence == base_seq)
+            .map(|entry| entry.data.clone())
+        else {
+            tracing::debug!(
+                "[SNAPSHOT] missing base sequence {}; waiting for raw frame",
+                base_seq
+            );
+            self.window.clear();
+            self.waiting_for_keyframe = true;
+            return None;
+        };
+
+        let Some(xor_buf) = rle_decode(payload) else {
+            tracing::debug!("[SNAPSHOT] truncated RLE payload");
+            return None;
+        };
+
+        if xor_buf.len() > MAX_STATE_SIZE {
+            tracing::debug!(
+                "[SNAPSHOT] ignore oversized delta bytes={} max={}",
+                xor_buf.len(),
+                MAX_STATE_SIZE
+            );
+            return None;
+        }
+
+        let mut new_state = vec![0u8; xor_buf.len()];
+        let copy_len = base.len().min(xor_buf.len());
+        for i in 0..copy_len {
+            new_state[i] = base[i] ^ xor_buf[i];
+        }
+        if xor_buf.len() > base.len() {
+            new_state[base.len()..].copy_from_slice(&xor_buf[base.len()..]);
+        }
+
+        // A non-zero save_seq marks a keyframe, which becomes a future base.
+        if save_seq != 0 {
+            self.add_to_window(save_seq, new_state.clone());
+            self.waiting_for_keyframe = false;
+        }
+
+        Some(new_state)
     }
 
-    /// Force the reader to ignore deltas until the next keyframe or raw
-    /// frame. Used after a desync is detected.
+    /// Force the reader to ignore deltas until the next raw frame.
     pub fn force_wait_for_keyframe(&mut self) {
         self.window.clear();
-        self.latest_full_state.clear();
-        self.current_sequence = 0;
         self.waiting_for_keyframe = true;
     }
 
     /// Insert a frame into the sliding window, evicting the oldest entry
     /// if the window is full.
     fn add_to_window(&mut self, sequence: u8, data: Vec<u8>) {
-        self.window.retain(|e| e.sequence != sequence);
+        self.window.retain(|entry| entry.sequence != sequence);
         self.window.push(WindowEntry { sequence, data });
         while self.window.len() > MAX_WINDOW {
             self.window.remove(0);
@@ -149,56 +199,48 @@ impl Default for SnapshotReader {
 
 /// Server->Client snapshot encoder.
 ///
-/// Generates delta, key, or raw frames for a specific target client.
-/// Maintains an independent sliding window so each client receives a
-/// consistent delta sequence.
+/// Generates raw, key, or delta frames for a specific target client.
+/// Entries are ordered oldest-first; deltas are based on the oldest
+/// unacknowledged saved frame, because that is the frame the client is most
+/// likely to have. `ack()` prunes everything older than the acknowledged
+/// sequence.
 #[derive(Clone)]
 pub struct SnapshotWriter {
-    /// Next `save_seq` to assign to a keyframe or raw frame.
-    pub next_save_seq: u8,
-    /// Sliding window of recent frames (keyframes and raw frames).
+    /// Stream name used in diagnostics (e.g. `player_state`, `level_data`).
+    label: &'static str,
+    /// Next `save_seq` to assign to a save (raw/key) frame.
+    next_save_seq: u8,
+    /// Saved frames, oldest-first. The first entry is the preferred base.
     window: Vec<WindowEntry>,
-    /// Number of consecutive deltas emitted since the last keyframe.
-    delta_count: u8,
-    /// When `true`, the writer is in resync mode and will emit a raw
-    /// frame on the next call.
+    /// Number of frames written so far, used to schedule save frames.
+    write_count: usize,
+    /// True after the window filled up; saved frames are emitted twice as
+    /// often until an ack arrives.
     resync: bool,
-    /// Sequence number of the frame currently awaiting acknowledgment.
+    /// Sequence number of the saved frame currently awaiting acknowledgment.
     pending_ack_seq: Option<u8>,
-    /// Number of consecutive unacknowledged frames.
-    missed_acks: u8,
-    /// Force the next frame to be a keyframe (set after recovering from
-    /// resync via ack).
+    /// Force the next write to be a save frame.
     force_next_keyframe: bool,
-    /// Whether to track acknowledgments. Disabled for unacked writers.
-    track_acks: bool,
-    /// Sequence number of the most recent frame in the window, used to
-    /// select a base for XOR diffing.
-    last_saved_seq: Option<u8>,
 }
 
 impl SnapshotWriter {
-    /// Create a new writer starting at sequence 1.
+    /// Create a writer seeded with the empty sequence-1 base.
     pub fn new() -> Self {
-        Self {
-            next_save_seq: 1,
-            window: Vec::with_capacity(MAX_WINDOW),
-            delta_count: 0,
-            resync: false,
-            pending_ack_seq: None,
-            missed_acks: 0,
-            force_next_keyframe: false,
-            track_acks: true,
-            last_saved_seq: None,
-        }
+        Self::with_label("snapshot")
     }
 
-    /// Create a writer that does not track acknowledgments.
-    ///
-    /// Useful for broadcasts where individual acks are not expected.
-    pub fn new_unacked() -> Self {
-        let mut writer = Self::new();
-        writer.track_acks = false;
+    /// Create a labeled writer seeded with the empty sequence-1 base.
+    pub fn with_label(label: &'static str) -> Self {
+        let mut writer = Self {
+            label,
+            next_save_seq: 1,
+            window: Vec::with_capacity(MAX_WINDOW),
+            write_count: 0,
+            resync: false,
+            pending_ack_seq: None,
+            force_next_keyframe: false,
+        };
+        writer.reset_window();
         writer
     }
 
@@ -206,39 +248,65 @@ impl SnapshotWriter {
     ///
     /// Automatically chooses between raw, key, and delta based on window
     /// state, resync status, and the keyframe interval.
+    #[allow(clippy::manual_is_multiple_of)] // `usize::is_multiple_of` needs Rust 1.87
     pub fn generate_delta(&mut self, new_state: &[u8]) -> Vec<u8> {
         let new_len = new_state.len().min(MAX_STATE_SIZE);
 
-        tracing::debug!(
-            "[SNAPSHOT]generate_delta new_len={} resync={} windows_is_empty={} window_len={}",
-            new_len,
-            self.resync,
-            self.window.is_empty(),
-            self.window.len()
-        );
-
-        if self.resync {
-            return self.emit_raw(new_state, new_len);
-        }
-        if self.window.is_empty() {
-            return self.emit_raw(new_state, new_len);
-        }
+        // A full window means the client is not acknowledging save frames
+        // fast enough. Reset the sequence and fall back to a raw frame.
         if self.window.len() >= MAX_WINDOW {
-            // Window is at capacity — let add_to_window truncate old
-            // entries naturally. No need for a destructive resync.
-            tracing::warn!(
-                "[SNAPSHOT] window at capacity ({} entries), old entries will be evicted",
-                self.window.len()
-            );
+            if self.resync {
+                tracing::warn!(
+                    "[SNAPSHOT:{}] window still full during resync ({} entries), dropping oldest half",
+                    self.label,
+                    self.window.len()
+                );
+                let keep = MAX_WINDOW / 2;
+                let excess = self.window.len().saturating_sub(keep);
+                self.window.drain(..excess);
+            } else {
+                tracing::warn!(
+                    "[SNAPSHOT:{}] window full ({} entries), entering resync",
+                    self.label,
+                    self.window.len()
+                );
+                self.resync = true;
+                self.window.clear();
+                self.write_count = 0;
+                self.next_save_seq = 1;
+                self.pending_ack_seq = None;
+            }
         }
+
         if self.force_next_keyframe {
             self.force_next_keyframe = false;
-            return self.emit_keyframe(new_state, new_len);
+            let frame = if self.window.is_empty() {
+                self.emit_raw(new_state, new_len)
+            } else {
+                self.emit_keyframe(new_state, new_len)
+            };
+            self.write_count += 1;
+            return frame;
         }
-        if self.delta_count >= KEYFRAME_INTERVAL {
-            return self.emit_keyframe(new_state, new_len);
-        }
-        self.emit_delta(new_state, new_len)
+
+        let period = if self.resync {
+            (KEYFRAME_INTERVAL / 2).max(1)
+        } else {
+            KEYFRAME_INTERVAL.max(1)
+        };
+        let save_frame = self.window.is_empty() || self.write_count % period == 0;
+        let frame = if save_frame {
+            if self.window.is_empty() {
+                self.emit_raw(new_state, new_len)
+            } else {
+                self.emit_keyframe(new_state, new_len)
+            }
+        } else {
+            self.emit_delta(new_state, new_len)
+        };
+
+        self.write_count += 1;
+        frame
     }
 
     /// The sequence number currently awaiting an ack, if any.
@@ -246,171 +314,142 @@ impl SnapshotWriter {
         self.pending_ack_seq
     }
 
-    /// Acknowledge receipt of the frame with the given sequence number.
+    /// Acknowledge a previously emitted `save_seq`.
     ///
-    /// Returns `true` if the ack matched the pending frame.
-    ///
-    /// Prunes the snapshot window of entries at or before the acked
-    /// sequence, keeping the window small. Uses wrapping comparison to
-    /// handle `u8` overflow safely (window spread is well within 127).
+    /// Returns `true` if the sequence is still in the window. Prunes entries
+    /// older than the acknowledged sequence (wrapping-safe for the u8 range)
+    /// and leaves resync mode.
     pub fn ack(&mut self, seq: u8) -> bool {
-        let matched = self.pending_ack_seq == Some(seq);
-        if matched {
-            self.pending_ack_seq = None;
-            self.missed_acks = 0;
-
-            // Keep entries at or after the acked sequence (the acked
-            // entry itself is still a valid base for future deltas).
-            // Wrapping distance 0..=127 covers seq itself and anything
-            // after it. Older entries (< seq) are safe to discard.
-            self.window.retain(|e| e.sequence.wrapping_sub(seq) <= 127);
-
-            if self.resync {
-                self.resync = false;
-                self.force_next_keyframe = true;
-            }
+        if !self.window.iter().any(|entry| entry.sequence == seq) {
+            return false;
         }
-        matched
+
+        self.pending_ack_seq = None;
+        self.window
+            .retain(|entry| entry.sequence.wrapping_sub(seq) <= 127);
+
+        if self.resync {
+            self.resync = false;
+            tracing::debug!(
+                "[SNAPSHOT:{}] resync complete after ack seq={}",
+                self.label,
+                seq
+            );
+        }
+
+        true
     }
 
-    /// Reset the writer to a clean state, clearing the window and all
-    /// internal counters.
+    /// Reset the writer to the seeded empty base and force the next write to
+    /// be a keyframe.
     pub fn force_keyframe(&mut self) {
-        self.window.clear();
-        self.delta_count = 0;
-        self.resync = false;
-        self.pending_ack_seq = None;
-        self.missed_acks = 0;
-        self.force_next_keyframe = false;
-        self.last_saved_seq = None;
+        self.reset_window();
     }
 
     // ── private helpers ──────────────────────────────────────────────
 
-    /// Emit a delta frame: `[0, base_seq, checksum, rle_xor_data]`.
-    fn emit_delta(&mut self, new_state: &[u8], new_len: usize) -> Vec<u8> {
-        let Some((base_sequence, base_data)) = self.base_snapshot() else {
-            return self.emit_raw(new_state, new_len);
-        };
-        let xor_buf = xor_diff(new_state, base_data.as_slice(), new_len);
-        let non_zero = xor_buf.iter().filter(|&&b| b != 0).count();
-        let rle_data = rle_encode(&xor_buf);
-        tracing::debug!(
-            "[SNAPSHOT] DELTA baseSeq={} raw={} non0={} pct={:.1}% rle={} ratio={:.0}%",
-            base_sequence,
-            xor_buf.len(),
-            non_zero,
-            non_zero as f64 / xor_buf.len() as f64 * 100.0,
-            rle_data.len(),
-            rle_data.len() as f64 / xor_buf.len() as f64 * 100.0
-        );
-        if rle_data.len() > xor_buf.len() {
-            self.resync = true;
-            self.window.clear();
-            return self.emit_raw(new_state, new_len);
-        }
-        self.delta_count += 1;
-        let chk = snapshot_checksum(&rle_data);
-        let mut d = Vec::with_capacity(3 + rle_data.len());
-        d.push(0); // delta: save_seq = 0
-        d.push(base_sequence);
-        d.push(chk);
-        d.extend_from_slice(&rle_data);
-        d
+    /// Reset all sequence/window state to the empty sequence-1 base.
+    fn reset_window(&mut self) {
+        self.next_save_seq = 2;
+        self.window.clear();
+        self.window.push(WindowEntry {
+            sequence: 1,
+            data: Vec::new(),
+        });
+        self.write_count = 0;
+        self.resync = false;
+        self.pending_ack_seq = None;
+        self.force_next_keyframe = false;
     }
 
-    /// Emit a keyframe: `[save_seq, base_seq, checksum, rle_xor_data]`.
-    fn emit_keyframe(&mut self, new_state: &[u8], new_len: usize) -> Vec<u8> {
-        let Some((base_sequence, base_data)) = self.base_snapshot() else {
-            return self.emit_raw(new_state, new_len);
-        };
-        let sv = self.next_save_seq;
-        self.next_save_seq = self.next_save_seq.wrapping_add(1).max(1);
-        self.delta_count = 0;
-        let xor_buf = xor_diff(new_state, base_data.as_slice(), new_len);
-        let non_zero = xor_buf.iter().filter(|&&b| b != 0).count();
-        tracing::debug!(
-            "[SNAPSHOT] KEYFRAME baseSeq={} saveSeq={} xor_total={} non_zero={} pct={:.1}%",
-            base_sequence,
-            sv,
-            xor_buf.len(),
-            non_zero,
-            non_zero as f64 / xor_buf.len() as f64 * 100.0
-        );
-        let rle_data = rle_encode(&xor_buf);
-        if rle_data.len() > xor_buf.len() {
-            self.resync = true;
-            self.window.clear();
-            return self.emit_raw(new_state, new_len);
-        }
-        let chk = snapshot_checksum(&rle_data);
-        let mut d = Vec::with_capacity(3 + rle_data.len());
-        d.push(sv);
-        d.push(base_sequence);
-        d.push(chk);
-        d.extend_from_slice(&rle_data);
-        self.add_to_window(sv, new_state[..new_len].to_vec());
-        self.mark_ack_required(sv);
-        d
+    /// Allocate the next `save_seq`, skipping zero on wrap.
+    fn allocate_save_seq(&mut self) -> u8 {
+        let seq = self.next_save_seq;
+        let next = self.next_save_seq.wrapping_add(1);
+        self.next_save_seq = if next == 0 { 1 } else { next };
+        seq
+    }
+
+    /// Select the oldest saved frame as the XOR base.
+    fn base_snapshot(&self) -> Option<(u8, Vec<u8>)> {
+        self.window
+            .first()
+            .map(|entry| (entry.sequence, entry.data.clone()))
     }
 
     /// Emit a raw frame: `[save_seq, 0, checksum, state_bytes]`.
     fn emit_raw(&mut self, new_state: &[u8], new_len: usize) -> Vec<u8> {
-        let sv = self.next_save_seq;
-        self.next_save_seq = self.next_save_seq.wrapping_add(1).max(1);
-        self.delta_count = 0;
-        let chk = snapshot_checksum(&new_state[..new_len]);
-        let mut d = Vec::with_capacity(3 + new_len);
-        d.push(sv);
-        d.push(0); // raw: base_seq = 0
-        d.push(chk);
-        d.extend_from_slice(&new_state[..new_len]);
-        self.add_to_window(sv, new_state[..new_len].to_vec());
-        self.mark_ack_required(sv);
-        d
-    }
-
-    /// Mark the given sequence as requiring acknowledgment. Enters
-    /// resync mode if too many consecutive acks are missed.
-    fn mark_ack_required(&mut self, seq: u8) {
-        if !self.track_acks {
-            return;
-        }
-
-        if self.pending_ack_seq.is_some() {
-            self.missed_acks = self.missed_acks.saturating_add(1);
-            if self.missed_acks >= MAX_MISSED_ACKS {
-                self.resync = true;
-                tracing::warn!(
-                    "[SNAPSHOT] missed ack pending={:?} new_seq={} count={}, enter panic/resync mode",
-                    self.pending_ack_seq,
-                    seq,
-                    self.missed_acks
-                );
-            }
-        }
+        let state = &new_state[..new_len];
+        let seq = self.allocate_save_seq();
+        let checksum = snapshot_checksum(state);
+        let mut frame = Vec::with_capacity(3 + new_len);
+        frame.push(seq);
+        frame.push(0);
+        frame.push(checksum);
+        frame.extend_from_slice(state);
+        self.add_to_window(seq, state.to_vec());
         self.pending_ack_seq = Some(seq);
+        frame
     }
 
-    /// Select the best base frame for XOR diffing.
-    ///
-    /// Prefers the most recently saved frame; falls back to the oldest
-    /// entry in the window.
-    fn base_snapshot(&self) -> Option<(u8, Vec<u8>)> {
-        self.last_saved_seq
-            .and_then(|sequence| self.window.iter().find(|entry| entry.sequence == sequence))
-            .or_else(|| self.window.first())
-            .map(|entry| (entry.sequence, entry.data.clone()))
+    /// Emit a keyframe: `[save_seq, base_seq, checksum, rle_xor_data]`.
+    fn emit_keyframe(&mut self, new_state: &[u8], new_len: usize) -> Vec<u8> {
+        let Some((base_seq, base)) = self.base_snapshot() else {
+            return self.emit_raw(new_state, new_len);
+        };
+
+        let xor_buf = xor_diff(new_state, &base, new_len);
+        let rle_data = rle_encode(&xor_buf);
+
+        if rle_data.len() > xor_buf.len() {
+            self.resync = true;
+            self.window.clear();
+            return self.emit_raw(new_state, new_len);
+        }
+
+        let seq = self.allocate_save_seq();
+        let checksum = snapshot_checksum(&rle_data);
+        let mut frame = Vec::with_capacity(3 + rle_data.len());
+        frame.push(seq);
+        frame.push(base_seq);
+        frame.push(checksum);
+        frame.extend_from_slice(&rle_data);
+        self.add_to_window(seq, new_state[..new_len].to_vec());
+        self.pending_ack_seq = Some(seq);
+        frame
     }
 
-    /// Add a frame to the front of the sliding window.
-    ///
-    /// Deduplicates by sequence number and truncates to `MAX_WINDOW`.
+    /// Emit a delta: `[0, base_seq, checksum, rle_xor_data]`.
+    fn emit_delta(&mut self, new_state: &[u8], new_len: usize) -> Vec<u8> {
+        let Some((base_seq, base)) = self.base_snapshot() else {
+            return self.emit_raw(new_state, new_len);
+        };
+
+        let xor_buf = xor_diff(new_state, &base, new_len);
+        let rle_data = rle_encode(&xor_buf);
+
+        if rle_data.len() > xor_buf.len() {
+            self.resync = true;
+            self.window.clear();
+            return self.emit_raw(new_state, new_len);
+        }
+
+        let checksum = snapshot_checksum(&rle_data);
+        let mut frame = Vec::with_capacity(3 + rle_data.len());
+        frame.push(0); // delta frames are not stored or acknowledged
+        frame.push(base_seq);
+        frame.push(checksum);
+        frame.extend_from_slice(&rle_data);
+        frame
+    }
+
+    /// Add a saved frame to the window, evicting the oldest entry.
     fn add_to_window(&mut self, sequence: u8, data: Vec<u8>) {
-        self.window.retain(|e| e.sequence != sequence);
-        self.window.insert(0, WindowEntry { sequence, data });
-        self.window.truncate(MAX_WINDOW);
-        self.last_saved_seq = Some(sequence);
+        self.window.retain(|entry| entry.sequence != sequence);
+        self.window.push(WindowEntry { sequence, data });
+        while self.window.len() > MAX_WINDOW {
+            self.window.remove(0);
+        }
     }
 }
 
@@ -431,13 +470,13 @@ fn rle_encode(data: &[u8]) -> Vec<u8> {
     let mut i = 0;
     while i < data.len() {
         if data[i] == 0 {
-            let mut c = 0u8;
-            while i < data.len() && c < 255 && data[i] == 0 {
-                c += 1;
+            let mut count = 0u8;
+            while i < data.len() && count < 255 && data[i] == 0 {
+                count += 1;
                 i += 1;
             }
             out.push(0x00);
-            out.push(c);
+            out.push(count);
         } else {
             out.push(data[i]);
             i += 1;
@@ -448,7 +487,7 @@ fn rle_encode(data: &[u8]) -> Vec<u8> {
 
 /// Decode an RLE-encoded byte slice.
 ///
-/// Returns `None` if the data is truncated (0x00 without a count byte).
+/// Returns `None` if the data is truncated (0x00 without a valid count).
 fn rle_decode(data: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(data.len());
     let mut i = 0;
@@ -457,7 +496,11 @@ fn rle_decode(data: &[u8]) -> Option<Vec<u8>> {
             if i + 1 >= data.len() {
                 return None;
             }
-            out.resize(out.len() + data[i + 1] as usize, 0);
+            let count = data[i + 1];
+            if count == 0 {
+                return None;
+            }
+            out.resize(out.len() + count as usize, 0);
             i += 2;
         } else {
             out.push(data[i]);
@@ -472,9 +515,9 @@ fn rle_decode(data: &[u8]) -> Option<Vec<u8>> {
 /// Bytes beyond `base.len()` in `new` are copied as-is (they have no
 /// base to XOR against).
 fn xor_diff(new: &[u8], base: &[u8], new_len: usize) -> Vec<u8> {
-    let bl = base.len().min(new_len);
+    let base_len = base.len().min(new_len);
     let mut buf = vec![0u8; new_len];
-    for i in 0..bl {
+    for i in 0..base_len {
         buf[i] = new[i] ^ base[i];
     }
     if new_len > base.len() {
@@ -518,36 +561,120 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let mut w = SnapshotWriter::new();
-        let mut r = SnapshotReader::new();
-        let s1 = vec![0xAAu8; 100];
-        let f1 = w.generate_delta(&s1);
-        assert_eq!(f1[0], 1);
-        assert_eq!(f1[1], 0); // Raw: save=1, base=0
-        assert_eq!(r.apply_delta(&f1).unwrap(), s1);
+        let mut writer = SnapshotWriter::new();
+        let mut reader = SnapshotReader::new();
 
-        for i in 0..KEYFRAME_INTERVAL {
-            let s = vec![0xAAu8.wrapping_add(i as u8 + 1); 100];
-            let f = w.generate_delta(&s);
-            assert_eq!(f[0], 0, "delta {} saveSeq", i); // Delta: save=0
-            assert_eq!(f[1], 1); // base=1
-            assert_eq!(r.apply_delta(&f).unwrap(), s);
+        // First frame is a keyframe against the seeded empty seq-1 base.
+        let state1 = vec![0xAAu8; 100];
+        let frame1 = writer.generate_delta(&state1);
+        assert_eq!(frame1[0], 2);
+        assert_eq!(frame1[1], 1);
+        assert_eq!(reader.apply_delta(&frame1).unwrap(), state1);
+
+        // Before an ack, deltas still base on the oldest unacked frame (seq 1).
+        let state2 = vec![0xBBu8; 100];
+        let frame2 = writer.generate_delta(&state2);
+        assert_eq!(frame2[0], 0);
+        assert_eq!(frame2[1], 1);
+        assert_eq!(reader.apply_delta(&frame2).unwrap(), state2);
+
+        // Acking the keyframe prunes the seed, so the next delta bases on seq 2.
+        assert!(writer.ack(2));
+        let state3 = vec![0xCCu8; 100];
+        let frame3 = writer.generate_delta(&state3);
+        assert_eq!(frame3[0], 0);
+        assert_eq!(frame3[1], 2);
+        assert_eq!(reader.apply_delta(&frame3).unwrap(), state3);
+
+        // An unknown sequence is not acknowledged.
+        assert!(!writer.ack(0x7f));
+    }
+
+    #[test]
+    fn keyframe_interval() {
+        let mut writer = SnapshotWriter::new();
+        let mut reader = SnapshotReader::new();
+
+        for i in 0..12u8 {
+            let state = vec![i; 64];
+            let frame = writer.generate_delta(&state);
+            if i == 0 {
+                assert_eq!(frame[0], 2);
+                assert_eq!(frame[1], 1);
+            } else if i == 10 {
+                assert_eq!(frame[0], 3);
+                assert_eq!(frame[1], 1);
+            } else {
+                assert_eq!(frame[0], 0);
+            }
+            assert_eq!(reader.apply_delta(&frame).unwrap(), state);
+        }
+    }
+
+    #[test]
+    fn force_keyframe_resets_to_seed() {
+        let mut writer = SnapshotWriter::new();
+        let _ = writer.generate_delta(&[0x11u8; 32]);
+        writer.force_keyframe();
+
+        let frame = writer.generate_delta(&[0x22u8; 32]);
+        assert_eq!(frame[0], 2);
+        assert_eq!(frame[1], 1);
+    }
+
+    #[test]
+    fn missing_base_requires_raw_frame() {
+        let mut reader = SnapshotReader::new();
+        let mut writer = SnapshotWriter::new();
+
+        let state1 = vec![0x11u8; 32];
+        let keyframe = writer.generate_delta(&state1);
+        let delta = writer.generate_delta(&[0x22u8; 32]);
+
+        // A delta referencing an unknown base resets the reader.
+        let mut bad = vec![0u8, 99];
+        let payload = vec![0x33u8; 8];
+        bad.push(snapshot_checksum(&payload));
+        bad.extend_from_slice(&payload);
+        assert!(reader.apply_delta(&bad).is_none());
+        assert!(reader.apply_delta(&delta).is_none());
+
+        // Only a raw frame restores the reader.
+        let raw_state = vec![0x44u8; 32];
+        let mut raw = vec![7u8, 0];
+        raw.push(snapshot_checksum(&raw_state));
+        raw.extend_from_slice(&raw_state);
+        assert_eq!(reader.apply_delta(&raw).unwrap(), raw_state);
+
+        // The original keyframe is no longer usable after the reset.
+        assert!(reader.apply_delta(&keyframe).is_none());
+    }
+
+    #[test]
+    fn window_overflow_enters_resync() {
+        let mut writer = SnapshotWriter::new();
+        let mut saw_raw = false;
+
+        for i in 0..200u8 {
+            let frame = writer.generate_delta(&[i; 16]);
+            if i > 0 && frame[0] != 0 && frame[1] == 0 {
+                saw_raw = true;
+                break;
+            }
         }
 
-        let sk = vec![0xBBu8; 100];
-        let fk = w.generate_delta(&sk);
-        assert_eq!(fk[0], 2); // Key: save=2
-        assert_eq!(fk[1], 1); // base=1
-        assert_eq!(r.apply_delta(&fk).unwrap(), sk);
-
-        w.ack(1);
-        assert_eq!(w.generate_delta(&sk)[0], 0); // delta after ack
+        assert!(
+            saw_raw,
+            "writer should emit a raw frame after the window fills"
+        );
     }
 
     #[test]
     fn rle_roundtrip() {
-        let d = vec![0u8; 40];
-        assert_eq!(rle_encode(&d), vec![0x00, 40]);
-        assert_eq!(rle_decode(&rle_encode(&d)).unwrap(), d);
+        let data = vec![0u8; 40];
+        assert_eq!(rle_encode(&data), vec![0x00, 40]);
+        assert_eq!(rle_decode(&rle_encode(&data)).unwrap(), data);
+        assert!(rle_decode(&[0x00]).is_none());
+        assert!(rle_decode(&[0x00, 0x00]).is_none());
     }
 }

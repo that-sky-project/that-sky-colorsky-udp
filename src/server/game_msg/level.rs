@@ -13,7 +13,7 @@ use crate::{
         packet::Packet,
     },
     server::{PeerEntry, game_msg::level},
-    utils::hex_preview,
+    utils::{hex_preview, snapshot::SnapshotWriter},
 };
 
 impl crate::server::state::ServerState {
@@ -37,13 +37,20 @@ impl crate::server::state::ServerState {
         }
 
         let level_data = LevelData::from_bytes(&raw_level_data)?;
+        let level_id = peer.level_id;
 
-        let last_level_data = self.levels_data.get_mut(&peer.level_id)?;
-
-        tracing::debug!("[LEVEL_DATA] last: {:?}", &last_level_data.header);
-        tracing::debug!("[LEVEL_DATA] new: {:?}", &level_data.header);
-
-        last_level_data.update(&level_data);
+        if let Some(last_level_data) = self.levels_data.get_mut(&level_id) {
+            tracing::debug!("[LEVEL_DATA] last: {:?}", &last_level_data.header);
+            tracing::debug!("[LEVEL_DATA] new: {:?}", &level_data.header);
+            last_level_data.update(&level_data);
+        } else {
+            // The level cache is created by the first real authority upload.
+            // Do not stream empty level data before that point.
+            tracing::debug!("[LEVEL_DATA] new: {:?}", &level_data.header);
+            let mut level_data = level_data;
+            level_data.header.elected_player = peer.player_id;
+            self.levels_data.insert(level_id, level_data);
+        }
 
         Some(())
     }
@@ -114,9 +121,6 @@ impl crate::server::state::ServerState {
     pub(crate) fn send_elect_to(&mut self, to: usize) -> Option<()> {
         let peer = self.peers.get_mut(&to)?;
 
-        // Cannot send delta frame, idk why.
-        peer.level_delta.snap_writer.force_keyframe();
-
         let level_id = peer.level_id;
 
         let authority = if let Some(authority) = self.level_authority.get(&level_id) {
@@ -126,28 +130,30 @@ impl crate::server::state::ServerState {
             peer.player_id
         };
 
-        let level_data = if let Some(level_data) = self.levels_data.get_mut(&level_id) {
-            level_data
+        let level_bytes = if let Some(level_data) = self.levels_data.get_mut(&level_id) {
+            // when player enter a non-player & non-empty level, we need set its authority
+            level_data.header.elected_player = authority;
+            level_data.to_bytes()
         } else {
-            let level_data = LevelData::new(authority, level_id, 0, &[]);
-            self.levels_data.insert(level_id, level_data);
-            self.levels_data.get_mut(&level_id)?
+            // Keep only the Elect payload local; the cache is populated when
+            // the authority uploads real level data (matches XYSKY).
+            LevelData::new(authority, level_id, 0, &[]).to_bytes()
         };
 
-        // when player enter a non-player & non-empty level, we need set its authority
-        level_data.header.elected_player = authority;
-
-        let mut snap = peer
-            .level_delta
-            .snap_writer
-            .generate_delta(&level_data.to_bytes());
+        // Elect is decoded by a temporary client reader initialized with the
+        // empty sequence-1 base. Use a fresh writer here so the persistent
+        // NetLevelData stream keeps its sequence/window intact; resetting the
+        // peer writer would make the client lose the base and stop acking.
+        let mut elect_writer = SnapshotWriter::new();
+        let snap = elect_writer.generate_delta(&level_bytes);
 
         let msg = GameMsg::new(GameMsgId::NetLevelDataElect, peer.lv_seq, 0, &snap);
 
         tracing::debug!(
-            "[ENET:LEVEL_ECLECT] send to {}, level data header={:?}",
+            "[ENET:LEVEL_ECLECT] send to {}, level_id={:#x} authority={}",
             peer.player_id,
-            level_data.header
+            level_id,
+            authority
         );
 
         self.send_msg_to(msg, to)

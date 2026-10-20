@@ -24,7 +24,7 @@ impl PlayerState {
         Self {
             raw_state: Vec::new(),
             snap_reader: SnapshotReader::new(),
-            snap_writer: SnapshotWriter::new(),
+            snap_writer: SnapshotWriter::with_label("player_state"),
             snapshot_ack: None,
         }
     }
@@ -43,7 +43,7 @@ impl LevelDelta {
         Self {
             raw_state: Vec::new(),
             snap_reader: SnapshotReader::new(),
-            snap_writer: SnapshotWriter::new(),
+            snap_writer: SnapshotWriter::with_label("level_data"),
             snapshot_ack: None,
         }
     }
@@ -95,7 +95,7 @@ impl PeerEntry {
     pub fn send(&self, channel: u8, data: &[u8], reliable: bool) {
         unsafe {
             let flags = if reliable {
-                enet_sys::_ENetPacketFlag_ENET_PACKET_FLAG_RELIABLE
+                enet_sys::_ENetPacketFlag_ENET_PACKET_FLAG_RELIABLE as u32
             } else {
                 0
             };

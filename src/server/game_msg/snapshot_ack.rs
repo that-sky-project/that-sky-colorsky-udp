@@ -15,13 +15,20 @@ impl crate::server::state::ServerState {
     pub(super) fn handle_snapshot_ack(&mut self, peer_key: usize, msg: GameMsg) -> Option<()> {
         let peer = self.peers.get_mut(&peer_key)?;
 
-        if let Some(player_state_pending) = peer.player_delta.snap_writer.pending_ack_seq() {
-            peer.player_delta.snap_writer.ack(*msg.payload.first()?);
-        }
+        // The writers validate the sequence against their own window, so the
+        // ack is safe to apply unconditionally (same contract as XYSKY).
+        let player_ack = msg.payload.first().copied();
+        let level_ack = msg.payload.get(1).copied();
+        let player_matched = player_ack.map(|seq| peer.player_delta.snap_writer.ack(seq));
+        let level_matched = level_ack.map(|seq| peer.level_delta.snap_writer.ack(seq));
 
-        if let Some(level_data_pending) = peer.level_delta.snap_writer.pending_ack_seq() {
-            peer.level_delta.snap_writer.ack(*msg.payload.get(1)?);
-        }
+        tracing::debug!(
+            "[SNAPSHOT] ack player={:?} matched={:?} level={:?} matched={:?}",
+            player_ack,
+            player_matched,
+            level_ack,
+            level_matched
+        );
 
         Some(())
     }
