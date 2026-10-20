@@ -3,6 +3,17 @@
 UDP game server for *Sky: Children of the Light*, built on [ENet](http://enet.bespin.org/)
 with CRC32 packet checksums.
 
+## QWD support
+
+QWD (Hermes room manager) node support is maintained on the **`qwd`** branch,
+not on `main`:
+
+- Branch: [`that-sky-project/that-sky-colorsky-udp@qwd`](https://github.com/that-sky-project/that-sky-colorsky-udp/tree/qwd)
+- QWD manager: [`that-sky-project/that-sky-xysky-udp-room-authority`](https://github.com/that-sky-project/that-sky-xysky-udp-room-authority)
+
+`main` remains the standalone server without the QWD adapter. Use the `qwd`
+branch when deploying a node managed by QWD.
+
 ## Quick Start
 
 Install Rust and add build dependencies 
