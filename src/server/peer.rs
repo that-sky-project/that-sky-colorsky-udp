@@ -112,6 +112,7 @@ impl PeerEntry {
     ///
     /// `reliable` controls whether the packet is sent with the
     /// `ENET_PACKET_FLAG_RELIABLE` flag. Returns the ENet result code.
+    #[allow(clippy::unnecessary_cast)] // enet-sys binds this flag as i32 on Windows and u32 elsewhere
     pub fn send(&self, channel: u8, data: &[u8], reliable: bool) -> i32 {
         unsafe {
             let flags = if reliable {
