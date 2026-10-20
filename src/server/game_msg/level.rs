@@ -8,6 +8,7 @@ use crate::{
         self,
         game_msg::{
             GameMsg, GameMsgId,
+            heartbeat::NetLevelDataHeartbeat,
             level_data::{self, LevelData},
         },
         packet::Packet,
@@ -78,10 +79,42 @@ impl crate::server::state::ServerState {
     /// Handle level heart beat
     pub(super) fn handle_level_heart_beat(&mut self, peer_key: usize, msg: GameMsg) -> Option<()> {
         let peer = self.peers.get(&peer_key)?;
+        let heartbeat = NetLevelDataHeartbeat::from_bytes(&msg.payload)?;
 
-        self.level_authority
-            .entry(peer.level_id)
-            .or_insert(peer.player_id);
+        if heartbeat.level_id != peer.level_id {
+            tracing::debug!(
+                player_id = peer.player_id,
+                player_level_id = peer.level_id,
+                heartbeat_level_id = heartbeat.level_id,
+                "ignored level heartbeat for non-current level"
+            );
+            return None;
+        }
+
+        let level_id = peer.level_id;
+        let player_id = peer.player_id;
+
+        // A heartbeat is also a claim that this level still has an authority.
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            self.level_authority.entry(level_id)
+        {
+            entry.insert(player_id);
+            tracing::info!(
+                level_id = level_id,
+                player_id = player_id,
+                "level authority elected by heartbeat"
+            );
+        }
+
+        tracing::debug!(
+            player_id = player_id,
+            level_id = level_id,
+            ready = heartbeat.ready,
+            net_player_id = heartbeat.net_player_id,
+            authority_version = heartbeat.authority_version,
+            trailing_bytes = heartbeat.trailing_bytes,
+            "received level heartbeat"
+        );
 
         Some(())
     }

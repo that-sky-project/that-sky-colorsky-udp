@@ -23,6 +23,9 @@
 //! - `net_player_id` — `u8`, derived from [`TgcUuid`](super::types::TgcUuid)
 //!   via `fnv1a_player_id`
 
+pub mod move_result;
+pub mod net_time;
+
 /// Represents a parsed packet from the client or server.
 pub struct Packet {
     pub packet_id: PacketId,
@@ -150,7 +153,13 @@ pub enum PacketId {
 
     /// C->S.
     ///
-    /// *TODO: payload format unknown.*
+    /// Result of a `MoveGame` request.
+    ///
+    /// ## Payload
+    ///
+    /// ```text
+    /// [result: u8] [payload: ...]
+    /// ```
     MoveResult = 10,
 
     /// S->C.
@@ -234,5 +243,22 @@ impl PacketId {
     /// Serialize this packet type to a `u8` byte.
     pub fn to_u8(self) -> u8 {
         self as u8
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn known_ids_roundtrip() {
+        for id in 0u8..=14 {
+            let packet = PacketId::from_u8(id).expect("known packet id");
+            assert_eq!(packet.to_u8(), id);
+        }
+        assert_eq!(PacketId::from_u8(17).unwrap().to_u8(), 17);
+        assert_eq!(PacketId::from_u8(15), None);
+        assert_eq!(PacketId::from_u8(16), None);
+        assert_eq!(PacketId::from_u8(18), None);
     }
 }

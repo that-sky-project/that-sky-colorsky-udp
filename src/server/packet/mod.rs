@@ -2,6 +2,7 @@ use crate::protocol::{self, packet::PacketId};
 
 mod join;
 mod level_update;
+mod move_result;
 mod ping;
 mod utils;
 
@@ -23,6 +24,16 @@ impl crate::server::state::ServerState {
             // LevelUpdate
             PacketId::LevelUpdate => {
                 self.handle_level_update(peer_key, &packet.payload);
+            }
+
+            // Ping/pong time sync.
+            PacketId::NetTimePing => {
+                self.handle_ping(peer_key, &packet.payload);
+            }
+
+            // Result of a cross-room move request.
+            PacketId::MoveResult => {
+                self.handle_move_result(peer_key, &packet.payload);
             }
 
             // GameMsg need handle by the game_msg module.

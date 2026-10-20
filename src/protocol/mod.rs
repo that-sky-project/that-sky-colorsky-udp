@@ -19,6 +19,7 @@
 //! [packet_id:u8] [payload_len:u16] [payload]
 //! ```
 
+pub mod binary;
 pub mod game_msg;
 pub mod packet;
 pub mod types;
