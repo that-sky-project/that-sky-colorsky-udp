@@ -5,14 +5,16 @@ impl crate::server::state::ServerState {
     pub(super) fn handle_level_update(&mut self, peer_key: usize, payload: &[u8]) -> Option<()> {
         let peer = self.peers.get_mut(&peer_key)?;
 
-        // each level updata packet will increase it
-        peer.lv_seq += 1;
-
+        // The client owns this counter. Trust the packet instead of assuming
+        // it increments by one; a mismatch makes the client drop every
+        // snapshot frame we send for the new level generation.
+        let level_change_count = *payload.first()?;
         let level_bytes = payload.get(14..18)?;
 
         let new_level = u32::from_le_bytes(<[u8; 4]>::try_from(level_bytes).ok()?);
 
         let old_level = peer.level_id;
+        peer.lv_seq = level_change_count;
 
         if old_level != new_level {
             let player_id = peer.player_id;
