@@ -19,10 +19,26 @@ impl crate::server::state::ServerState {
         peer_key: usize,
         game_msg: protocol::game_msg::GameMsg,
     ) {
-        // Force sync lv seq
-        let peer = self.peers.get_mut(&peer_key);
-        if let Some(peer) = peer {
-            peer.lv_seq = game_msg.level_seq;
+        // The level generation is owned by JoinGame/LevelUpdate. A GameMsg
+        // carrying a different generation was sent before the client saw the
+        // new level; dropping it keeps `lv_seq` stable, which the client
+        // requires before it will decode (and acknowledge) our snapshots.
+        //
+        // SnapshotAck is exempt: the writers validate the acknowledged
+        // sequence against their own window, so a stale ack is harmless while
+        // dropping it would stall the window.
+        if game_msg.msg_id != GameMsgId::SnapshotAck
+            && let Some(peer) = self.peers.get(&peer_key)
+            && game_msg.level_seq != peer.lv_seq
+        {
+            tracing::debug!(
+                player_id = peer.player_id,
+                expected = peer.lv_seq,
+                received = game_msg.level_seq,
+                msg_id = game_msg.msg_id.to_u8(),
+                "ignored GameMsg with stale level generation"
+            );
+            return;
         }
 
         match game_msg.msg_id {
