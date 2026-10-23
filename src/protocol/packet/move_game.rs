@@ -24,6 +24,13 @@ use crate::protocol::types::TgcUuid;
 /// Maximum number of players carried by one move.
 pub const MAX_MOVE_PLAYERS: usize = 7;
 
+/// Value for `MoveGame::u32_field2` meaning "no matchmaking event reservation".
+///
+/// The client stores this in its reservation slot (state+420) when the move is
+/// accepted. `u32::MAX` clears it; zero leaves a phantom reservation that makes
+/// later generic matchmaking signals get rejected.
+pub const NO_EVENT_RESERVATION: u32 = u32::MAX;
+
 /// Move destination and participant list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Move {
