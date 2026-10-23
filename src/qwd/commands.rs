@@ -12,7 +12,7 @@ use crate::protocol::types::TgcUuid;
 
 use super::protocol::{
     BAD_REQUEST, CONFLICT, INTERNAL, ManagerCommand, NO_CAPACITY, NODE_UNAVAILABLE, NOT_FOUND, OK,
-    STALE_PLAN, ack, event,
+    ack, event,
 };
 use super::util::{control_error, generate_room_id, now_ms};
 use super::{AckParts, PendingQwdMove, QwdClient, Socket};
@@ -225,26 +225,20 @@ impl QwdClient {
         }
 
         if let Some(expected) = command.u64_field("expectedVersion") {
-            // The manager's room version is the seq of the last telemetry
-            // frame it actually received, which may lag telemetry_seq when a
-            // delta was skipped because nothing changed.
+            // The manager's room version is the last telemetry seq it accepted.
+            // It can lag behind ours while its event loop is busy or while an
+            // older manager build drops frames. Rejecting with STALE_PLAN then
+            // deadlocks every move, so accept and re-validate the live room
+            // state below; the manager will catch up on its own.
             let current = self.last_telemetry_seq_sent;
-            if expected < current && current - expected > 3 {
+            if expected < current {
                 tracing::info!(
                     move_id = %move_id,
                     expected_version = expected,
                     current_version = current,
-                    "[QWD] move.prepare rejected: stale room snapshot"
+                    lag_frames = current - expected,
+                    "[QWD] move.prepare with stale manager version; validating live state"
                 );
-                return Ok((
-                    STALE_PLAN,
-                    Some("room state advanced past the plan".to_string()),
-                    Some(json!({
-                        "expectedVersion": expected,
-                        "currentVersion": current,
-                        "players": status.player_list.len()
-                    })),
-                ));
             }
         }
 
