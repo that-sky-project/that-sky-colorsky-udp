@@ -35,15 +35,16 @@ impl ServerState {
     /// Removes the peer from the table, broadcasts `PlayerLeft` to
     /// remaining in-game peers, and clears the level host record if the
     /// leaving player was the host.
-    pub(super) fn on_disconnect(&mut self, peer: *mut ENetPeer) {
+    pub(super) fn on_disconnect(&mut self, peer: *mut ENetPeer, reason: u32) {
         let Some(entry) = self.peers.remove(&(peer as usize)) else {
             return;
         };
         tracing::info!(
-            "[ENET:DISCONNECT] player={} uuid={:?} level={:#x}",
+            "[ENET:DISCONNECT] player={} uuid={:?} level={:#x} reason={}",
             entry.player_id,
             entry.uuid,
-            entry.level_id
+            entry.level_id,
+            reason
         );
 
         if entry.player_id != 0 {

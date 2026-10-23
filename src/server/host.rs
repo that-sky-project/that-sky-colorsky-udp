@@ -143,7 +143,7 @@ fn run_server(
                     state.on_receive(event.peer, event.channelID, event.packet);
                     unsafe { enet_packet_destroy(event.packet) };
                 }
-                ENET_EVENT_TYPE_DISCONNECT => state.on_disconnect(event.peer),
+                ENET_EVENT_TYPE_DISCONNECT => state.on_disconnect(event.peer, event.data),
                 other => tracing::debug!("[ENET] ignored event type={}", other),
             }
 
