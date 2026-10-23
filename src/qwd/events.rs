@@ -119,6 +119,55 @@ impl QwdClient {
         self.send_json(socket, &value)
     }
 
+    /// Tell the manager that every player of a move group has landed. This is
+    /// stronger than inferring completion from join/leave pairs, so the move
+    /// transaction can settle even if a leave event was lost.
+    pub(super) fn send_move_completed(
+        &self,
+        socket: &mut Socket,
+        move_id: &str,
+        player_ids: &[String],
+    ) -> Result<(), String> {
+        if !self.room_active {
+            return Ok(());
+        }
+
+        let value = event(
+            "move.completed",
+            json!({
+                "roomId": self.room_id,
+                "moveId": move_id,
+                "playerIds": player_ids,
+                "timestamp": now_ms()
+            }),
+        );
+        self.send_json(socket, &value)
+    }
+
+    /// Tell the manager that a target reservation expired before its group
+    /// arrived, so it can fail the transaction immediately.
+    pub(super) fn send_reservation_expired(
+        &self,
+        socket: &mut Socket,
+        move_id: &str,
+        player_ids: &[String],
+    ) -> Result<(), String> {
+        if !self.room_active {
+            return Ok(());
+        }
+
+        let value = event(
+            "reservation.expired",
+            json!({
+                "roomId": self.room_id,
+                "moveId": move_id,
+                "playerIds": player_ids,
+                "timestamp": now_ms()
+            }),
+        );
+        self.send_json(socket, &value)
+    }
+
     pub(super) fn send_move_result(
         &self,
         socket: &mut Socket,
@@ -159,7 +208,7 @@ impl QwdClient {
         match server_event {
             ServerEvent::PlayerJoined { uuid, level_id, .. } => {
                 let player_id = format!("{uuid:?}");
-                self.reservations.confirm_player(&player_id);
+                let completed = self.reservations.confirm_player(&player_id);
                 let value = event(
                     "player.join",
                     json!({
@@ -170,11 +219,15 @@ impl QwdClient {
                         }
                     }),
                 );
-                self.send_json(socket, &value)
+                self.send_json(socket, &value)?;
+                for (move_id, player_ids) in completed {
+                    self.send_move_completed(socket, &move_id, &player_ids)?;
+                }
+                Ok(())
             }
             ServerEvent::PlayerLeft { uuid, .. } => {
                 let player_id = format!("{uuid:?}");
-                self.reservations.confirm_player(&player_id);
+                let _ = self.reservations.confirm_player(&player_id);
                 let value = event(
                     "player.leave",
                     json!({

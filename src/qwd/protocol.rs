@@ -11,6 +11,8 @@ pub const BAD_REQUEST: i64 = 4000;
 pub const NOT_FOUND: i64 = 4004;
 pub const CONFLICT: i64 = 4009;
 pub const NO_CAPACITY: i64 = 4029;
+/// The manager planned against a room snapshot that has since advanced.
+pub const STALE_PLAN: i64 = 4090;
 pub const NODE_UNAVAILABLE: i64 = 5001;
 pub const INTERNAL: i64 = 5999;
 

@@ -100,6 +100,8 @@ automatically, and reports:
 - `player.join`, `player.leave`
 - `room.telemetry` once per second
 - `move.result` on failed or timed-out moves
+- `move.completed` once every player in a move group has landed
+- `reservation.expired` when a move hold times out before the group arrives
 - `node.draining`, `room.destroyed`
 
 It handles these QWD commands and acknowledges each one:
@@ -108,6 +110,10 @@ It handles these QWD commands and acknowledges each one:
 - `move.commit`, `player.redirect`
 - `node.drain`, `room.destroy`
 - `room.id_conflict`
+
+`move.prepare` honors the manager's `expectedVersion`; if the room's
+telemetry has advanced more than three snapshots past it, the node returns
+`4090 STALE_PLAN` instead of executing a plan built from old state.
 
 QWD reservations are counted against the eight-player room limit until the
 matching player joins or the reservation TTL expires. Room moves support single

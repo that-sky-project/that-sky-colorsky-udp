@@ -11,7 +11,11 @@ struct PlayerReservation {
 
 #[derive(Debug, Clone)]
 struct MoveReservation {
+    /// Original group, kept for `move.completed` after every member joined.
     player_ids: Vec<String>,
+    /// Members that have not joined yet. Capacity accounting uses this set so
+    /// players who already joined are not counted twice.
+    pending: HashSet<String>,
     expires_at: Instant,
 }
 
@@ -31,11 +35,22 @@ impl Reservations {
         self.moves.clear();
     }
 
-    pub fn expire(&mut self, now: Instant) {
+    /// Drop expired holds. Returns the move reservations that expired so the
+    /// caller can publish `reservation.expired` to the manager.
+    pub fn expire(&mut self, now: Instant) -> Vec<(String, Vec<String>)> {
         self.players
             .retain(|_, reservation| reservation.expires_at > now);
-        self.moves
-            .retain(|_, reservation| reservation.expires_at > now);
+
+        let mut expired = Vec::new();
+        self.moves.retain(|move_id, reservation| {
+            if reservation.expires_at > now {
+                true
+            } else {
+                expired.push((move_id.clone(), reservation.player_ids.clone()));
+                false
+            }
+        });
+        expired
     }
 
     /// Unique player ids currently reserved by any hold.
@@ -48,7 +63,7 @@ impl Reservations {
         }
         for reservation in self.moves.values() {
             if reservation.expires_at > now {
-                reserved.extend(reservation.player_ids.iter().cloned());
+                reserved.extend(reservation.pending.iter().cloned());
             }
         }
         reserved
@@ -115,6 +130,7 @@ impl Reservations {
             move_id.to_string(),
             MoveReservation {
                 player_ids: player_ids.to_vec(),
+                pending: player_ids.iter().cloned().collect(),
                 expires_at: now + ttl,
             },
         );
@@ -127,19 +143,23 @@ impl Reservations {
 
     /// A player actually joined; drop the corresponding allocation and move
     /// holds so occupancy is no longer double-counted.
-    pub fn confirm_player(&mut self, player_id: &str) {
+    ///
+    /// Returns every move whose whole group has now joined, so the caller can
+    /// publish `move.completed` with the original player list.
+    pub fn confirm_player(&mut self, player_id: &str) -> Vec<(String, Vec<String>)> {
         self.players.remove(player_id);
 
-        let mut empty_moves = Vec::new();
+        let mut completed = Vec::new();
         for (move_id, reservation) in &mut self.moves {
-            reservation.player_ids.retain(|id| id != player_id);
-            if reservation.player_ids.is_empty() {
-                empty_moves.push(move_id.clone());
+            reservation.pending.remove(player_id);
+            if reservation.pending.is_empty() {
+                completed.push((move_id.clone(), reservation.player_ids.clone()));
             }
         }
-        for move_id in empty_moves {
-            self.moves.remove(&move_id);
+        for (move_id, _) in &completed {
+            self.moves.remove(move_id);
         }
+        completed
     }
 
     #[cfg(test)]
@@ -219,9 +239,60 @@ mod tests {
             )
             .unwrap();
 
-        reservations.confirm_player("player-1");
+        let completed = reservations.confirm_player("player-1");
 
         assert_eq!(reservations.count(now), 0);
         assert_eq!(reservations.move_count(), 0);
+        assert_eq!(
+            completed,
+            vec![("move-1".to_string(), vec!["player-1".to_string()])]
+        );
+    }
+
+    #[test]
+    fn confirm_reports_completed_move_with_original_group() {
+        let mut reservations = Reservations::default();
+        let now = Instant::now();
+        reservations
+            .reserve_move(
+                "move-1",
+                &["player-1".to_string(), "player-2".to_string()],
+                Duration::from_secs(5),
+                now,
+            )
+            .unwrap();
+
+        assert!(reservations.confirm_player("player-1").is_empty());
+        assert_eq!(reservations.count(now), 1);
+
+        let completed = reservations.confirm_player("player-2");
+        assert_eq!(
+            completed,
+            vec![(
+                "move-1".to_string(),
+                vec!["player-1".to_string(), "player-2".to_string()]
+            )]
+        );
+        assert_eq!(reservations.move_count(), 0);
+    }
+
+    #[test]
+    fn expire_reports_move_reservations() {
+        let mut reservations = Reservations::default();
+        let now = Instant::now();
+        reservations
+            .reserve_move(
+                "move-1",
+                &["player-1".to_string()],
+                Duration::from_secs(5),
+                now,
+            )
+            .unwrap();
+
+        let expired = reservations.expire(now + Duration::from_secs(6));
+        assert_eq!(
+            expired,
+            vec![("move-1".to_string(), vec!["player-1".to_string()])]
+        );
     }
 }

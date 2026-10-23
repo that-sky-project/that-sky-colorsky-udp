@@ -11,7 +11,7 @@ use crate::protocol::net_address::NetAddress;
 
 use super::protocol::{
     BAD_REQUEST, CONFLICT, INTERNAL, ManagerCommand, NO_CAPACITY, NODE_UNAVAILABLE, NOT_FOUND, OK,
-    ack, event,
+    STALE_PLAN, ack, event,
 };
 use super::util::{control_error, generate_room_id, now_ms};
 use super::{AckParts, PendingQwdMove, QwdClient, Socket};
@@ -183,6 +183,27 @@ impl QwdClient {
                 .any(|player| &player.uuid == player_id)
         }) {
             return Ok((CONFLICT, Some("player already in room".to_string()), None));
+        }
+
+        if let Some(expected) = command.u64_field("expectedVersion") {
+            let current = self.telemetry_seq;
+            if expected < current && current - expected > 3 {
+                tracing::info!(
+                    move_id = %move_id,
+                    expected_version = expected,
+                    current_version = current,
+                    "[QWD] move.prepare rejected: stale room snapshot"
+                );
+                return Ok((
+                    STALE_PLAN,
+                    Some("room state advanced past the plan".to_string()),
+                    Some(json!({
+                        "expectedVersion": expected,
+                        "currentVersion": current,
+                        "players": status.player_list.len()
+                    })),
+                ));
+            }
         }
 
         let now = Instant::now();

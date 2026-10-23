@@ -152,7 +152,10 @@ impl QwdClient {
             self.drain_events(&mut socket)?;
 
             if last_telemetry.elapsed() >= Duration::from_secs(1) {
-                self.reservations.expire(Instant::now());
+                let expired = self.reservations.expire(Instant::now());
+                for (move_id, player_ids) in expired {
+                    self.send_reservation_expired(&mut socket, &move_id, &player_ids)?;
+                }
                 self.send_telemetry(&mut socket)?;
                 last_telemetry = Instant::now();
             }
