@@ -187,7 +187,7 @@ fn registers_and_answers_qwd_commands() {
                     "moveId": "move-1",
                     "playerIds": [player_id.clone()],
                     "fromRoomId": room_id,
-                    "toRoomId": "target-room",
+                    "toRoomId": "0d17e2c6-cdbd-40a5-983d-b9deb380dd00",
                     "udpHost": "127.0.0.1",
                     "udpPort": 5414
                 }

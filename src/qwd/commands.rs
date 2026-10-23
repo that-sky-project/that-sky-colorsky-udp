@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 
 use crate::control::{ControlCommand, ControlResponse, RoomEndpoint};
 use crate::protocol::net_address::NetAddress;
+use crate::protocol::types::TgcUuid;
 
 use super::protocol::{
     BAD_REQUEST, CONFLICT, INTERNAL, ManagerCommand, NO_CAPACITY, NODE_UNAVAILABLE, NOT_FOUND, OK,
@@ -325,8 +326,22 @@ impl QwdClient {
             return Ok((NOT_FOUND, Some("source room not found".to_string()), None));
         }
 
-        let Some(to_room_id) = command.room_id() else {
+        let Some(to_room_id) = command
+            .string_field("toRoomUuid")
+            .or_else(|| command.room_id())
+        else {
             return Ok((BAD_REQUEST, Some("toRoomId is required".to_string()), None));
+        };
+
+        // The client needs the destination room UUID in MoveGame to complete
+        // the transfer; a zero UUID makes it drop the connection instead of
+        // joining the target node.
+        let Some(destination_uuid) = TgcUuid::parse(to_room_id) else {
+            return Ok((
+                BAD_REQUEST,
+                Some("invalid destination room uuid".to_string()),
+                Some(json!({ "toRoomId": to_room_id })),
+            ));
         };
 
         tracing::debug!(
@@ -387,7 +402,7 @@ impl QwdClient {
         let room = RoomEndpoint {
             id: to_room_id.to_string(),
             address: NetAddress::new(host, udp_port as u16),
-            uuid: None,
+            uuid: Some(destination_uuid),
             capacity: 8,
             players: 0,
         };

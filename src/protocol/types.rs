@@ -21,6 +21,32 @@ impl TgcUuid {
     pub fn raw(&self) -> [u8; 16] {
         self.0
     }
+
+    /// Parse a hyphenated UUID string (the format used by QWD room ids).
+    pub fn parse(value: &str) -> Option<Self> {
+        let mut bytes = [0u8; 16];
+        let mut index = 0usize;
+        let mut high: Option<u8> = None;
+
+        for ch in value.chars() {
+            if ch == '-' {
+                continue;
+            }
+            let digit = ch.to_digit(16)? as u8;
+            match high.take() {
+                Some(high) => {
+                    if index >= bytes.len() {
+                        return None;
+                    }
+                    bytes[index] = (high << 4) | digit;
+                    index += 1;
+                }
+                None => high = Some(digit),
+            }
+        }
+
+        (index == bytes.len() && high.is_none()).then_some(Self(bytes))
+    }
 }
 
 impl Debug for TgcUuid {
@@ -37,5 +63,22 @@ impl Debug for TgcUuid {
             write!(s, "{:02x}", b).unwrap();
         }
         write!(f, "{}", s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TgcUuid;
+
+    #[test]
+    fn parse_matches_debug_format() {
+        let uuid = TgcUuid::from(&[0xabu8; 16]).unwrap();
+        assert_eq!(TgcUuid::parse(&format!("{uuid:?}")), Some(uuid));
+        assert_eq!(
+            TgcUuid::parse("00000000-0000-0000-0000-000000000000"),
+            Some(TgcUuid::default())
+        );
+        assert!(TgcUuid::parse("not-a-uuid").is_none());
+        assert!(TgcUuid::parse("00112233-4455-6677-8899-aabbccddee").is_none());
     }
 }
