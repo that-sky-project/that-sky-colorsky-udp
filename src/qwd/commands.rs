@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::time::Instant;
 
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::control::{ControlCommand, ControlResponse, RoomEndpoint};
 use crate::protocol::net_address::NetAddress;
@@ -18,7 +18,39 @@ use super::{AckParts, PendingQwdMove, QwdClient, Socket};
 
 impl QwdClient {
     pub(super) fn handle_command(&mut self, socket: &mut Socket, text: &str) -> Result<(), String> {
-        let command: ManagerCommand = match serde_json::from_str(text) {
+        let value: Value = match serde_json::from_str(text) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(error = %error, "[QWD] invalid command JSON");
+                return Ok(());
+            }
+        };
+
+        // The manager answers an invalid node event with `{ code, data: {
+        // message } }` and no command fields. Treat it as an error rather than
+        // letting serde report "missing field id" every second.
+        if value.get("cmd").is_none() {
+            let code = value.get("code").and_then(Value::as_i64);
+            let message = value
+                .pointer("/data/message")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let signature = format!("{code:?}:{message}");
+            if self.last_manager_error.as_deref() != Some(signature.as_str()) {
+                tracing::warn!(
+                    code = ?code,
+                    message,
+                    raw = %text,
+                    "[QWD] manager rejected a message"
+                );
+                self.last_manager_error = Some(signature);
+            } else {
+                tracing::debug!(code = ?code, message, "[QWD] manager error (repeated)");
+            }
+            return Ok(());
+        }
+
+        let command: ManagerCommand = match serde_json::from_value(value) {
             Ok(command) => command,
             Err(error) => {
                 tracing::warn!(error = %error, "[QWD] invalid command JSON");
@@ -87,6 +119,7 @@ impl QwdClient {
         self.last_telemetry_seq_sent = 0;
         self.last_full_telemetry_seq = 0;
         self.last_full_telemetry_at = Instant::now();
+        self.last_manager_error = None;
 
         tracing::warn!(room_id = %self.room_id, "[QWD] room id conflict; regenerated room id");
         self.send_room_created(socket)?;

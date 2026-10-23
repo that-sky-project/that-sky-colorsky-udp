@@ -82,6 +82,8 @@ pub struct QwdClient {
     /// Sequence of the last full telemetry snapshot.
     last_full_telemetry_seq: u64,
     last_full_telemetry_at: Instant,
+    /// Last manager error signature, to avoid repeating the same warning.
+    last_manager_error: Option<String>,
     draining: bool,
     internal_to_qwd: HashMap<u64, String>,
     qwd_moves: HashMap<String, PendingQwdMove>,
@@ -106,6 +108,7 @@ impl QwdClient {
                 last_telemetry_seq_sent: 0,
                 last_full_telemetry_seq: 0,
                 last_full_telemetry_at: Instant::now(),
+                last_manager_error: None,
                 draining: false,
                 internal_to_qwd: HashMap::new(),
                 qwd_moves: HashMap::new(),
@@ -153,6 +156,7 @@ impl QwdClient {
         self.last_telemetry_seq_sent = 0;
         self.last_full_telemetry_seq = 0;
         self.last_full_telemetry_at = Instant::now();
+        self.last_manager_error = None;
 
         self.send_node_ready(&mut socket)?;
         self.send_room_created(&mut socket)?;
