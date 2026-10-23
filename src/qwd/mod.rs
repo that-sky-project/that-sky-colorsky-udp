@@ -74,7 +74,6 @@ pub struct QwdClient {
     events: Receiver<ServerEvent>,
     reservations: Reservations,
     room_id: String,
-    room_version: u64,
     telemetry_seq: u64,
     /// Last player telemetry sent, used to build differential frames.
     telemetry_roster: Option<HashMap<String, Value>>,
@@ -102,7 +101,6 @@ impl QwdClient {
                 control,
                 events,
                 reservations: Reservations::default(),
-                room_version: 1,
                 telemetry_seq: 0,
                 telemetry_roster: None,
                 last_telemetry_seq_sent: 0,
@@ -147,8 +145,10 @@ impl QwdClient {
         self.reservations.clear();
         self.internal_to_qwd.clear();
         self.qwd_moves.clear();
-        self.room_version = 1;
-        self.telemetry_seq = 0;
+        // `telemetry_seq` is scoped to the room id, not the socket. QWD rejects
+        // a telemetry seq that is not strictly increasing for the same room,
+        // so a reconnect must continue from the previous value. Only
+        // `room.id_conflict` (which generates a new room id) resets it.
         self.telemetry_roster = None;
         self.last_telemetry_seq_sent = 0;
         self.last_full_telemetry_seq = 0;

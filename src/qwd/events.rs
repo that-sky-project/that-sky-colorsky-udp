@@ -49,7 +49,7 @@ impl QwdClient {
                 "port": self.config.public_port,
                 "capacity": self.config.capacity,
                 "players": players.min(8),
-                "version": self.room_version,
+                "version": self.telemetry_seq,
                 "timestamp": now_ms()
             }),
         );
@@ -65,7 +65,6 @@ impl QwdClient {
     }
 
     fn send_player_join(&mut self, socket: &mut Socket, player: &PlayerInfo) -> Result<(), String> {
-        self.room_version = self.room_version.wrapping_add(1);
         let value = event(
             "player.join",
             json!({
@@ -73,8 +72,7 @@ impl QwdClient {
                 "player": {
                     "playerId": player.uuid,
                     "level": player.level_id
-                },
-                "version": self.room_version
+                }
             }),
         );
         self.send_json(socket, &value)

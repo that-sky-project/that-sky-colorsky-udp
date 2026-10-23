@@ -81,7 +81,7 @@ impl QwdClient {
         self.reservations.clear();
         self.internal_to_qwd.clear();
         self.qwd_moves.clear();
-        self.room_version = 1;
+        // New room id, so its telemetry sequence starts over.
         self.telemetry_seq = 0;
         self.telemetry_roster = None;
         self.last_telemetry_seq_sent = 0;
