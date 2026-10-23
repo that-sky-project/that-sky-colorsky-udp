@@ -399,14 +399,23 @@ fn player_telemetry(player: &PlayerInfo) -> Value {
         value["lastMoveAt"] = json!(player.last_move_at);
     }
     if let Some(position) = player.position {
-        value["position"] = json!(position);
+        // serde_json encodes NaN/Infinity as null, which QWD's strict tuple
+        // schema rejects. Keep the field absent instead of sending a frame the
+        // manager will drop.
+        if position.iter().all(|coordinate| coordinate.is_finite()) {
+            value["position"] = json!(position);
+        }
     }
-    if let Some(velocity) = player.velocity {
+    if let Some(velocity) = player.velocity
+        && velocity.is_finite()
+    {
         value["velocity"] = json!(velocity);
     }
     let mut affinity = Map::new();
     for (player_id, weight) in &player.affinity {
-        affinity.insert(player_id.clone(), json!(weight));
+        if weight.is_finite() {
+            affinity.insert(player_id.clone(), json!(weight));
+        }
     }
     value["affinity"] = Value::Object(affinity);
     value
