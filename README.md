@@ -98,7 +98,10 @@ automatically, and reports:
 
 - `node.ready`, `room.created`
 - `player.join`, `player.leave`
-- `room.telemetry` once per second
+- `room.telemetry` once per second: a full snapshot first, then deltas with
+  `kind`/`baseSeq`/`removedPlayers`; a full resync is sent every 30 frames or
+  30 seconds. Telemetry carries `capacity`, `load`, and each player's
+  `position`, `velocity`, `stateAt`, `lastMoveAt` and `affinity` when known.
 - `move.result` on failed or timed-out moves
 - `move.completed` once every player in a move group has landed
 - `reservation.expired` when a move hold times out before the group arrives

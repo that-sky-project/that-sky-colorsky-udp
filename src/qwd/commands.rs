@@ -82,6 +82,11 @@ impl QwdClient {
         self.internal_to_qwd.clear();
         self.qwd_moves.clear();
         self.room_version = 1;
+        self.telemetry_seq = 0;
+        self.telemetry_roster = None;
+        self.last_telemetry_seq_sent = 0;
+        self.last_full_telemetry_seq = 0;
+        self.last_full_telemetry_at = Instant::now();
 
         tracing::warn!(room_id = %self.room_id, "[QWD] room id conflict; regenerated room id");
         self.send_room_created(socket)?;
@@ -186,7 +191,10 @@ impl QwdClient {
         }
 
         if let Some(expected) = command.u64_field("expectedVersion") {
-            let current = self.telemetry_seq;
+            // The manager's room version is the seq of the last telemetry
+            // frame it actually received, which may lag telemetry_seq when a
+            // delta was skipped because nothing changed.
+            let current = self.last_telemetry_seq_sent;
             if expected < current && current - expected > 3 {
                 tracing::info!(
                     move_id = %move_id,

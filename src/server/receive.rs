@@ -103,6 +103,7 @@ impl ServerState {
         let Some(entry) = self.peers.get_mut(&key) else {
             return;
         };
+        entry.last_seen_at_ms = super::peer::now_ms();
 
         match entry.conn_magic {
             // The first packet may only be JoinGame; its token becomes the

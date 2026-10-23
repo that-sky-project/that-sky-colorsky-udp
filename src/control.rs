@@ -120,6 +120,16 @@ pub struct PlayerInfo {
     pub player_id: u8,
     pub uuid: String,
     pub level_id: u32,
+    /// Last position decoded from the client's PlayerState header.
+    pub position: Option<[f32; 3]>,
+    /// Approximate speed in units per second from consecutive positions.
+    pub velocity: Option<f32>,
+    /// Unix milliseconds of the last successfully decoded PlayerState.
+    pub state_at: u64,
+    /// Unix milliseconds of the last packet received from this client.
+    pub last_move_at: u64,
+    /// Affinity weight keyed by the other player's UUID (0.0..=1.0).
+    pub affinity: Vec<(String, f32)>,
 }
 
 /// Server status snapshot.

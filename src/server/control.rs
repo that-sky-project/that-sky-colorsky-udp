@@ -65,10 +65,31 @@ impl ServerState {
                 .peers
                 .values()
                 .filter(|peer| peer.is_player())
-                .map(|peer| PlayerInfo {
-                    player_id: peer.player_id,
-                    uuid: format!("{:?}", peer.uuid),
-                    level_id: peer.level_id,
+                .map(|peer| {
+                    let affinity: Vec<(String, f32)> = peer
+                        .affinity
+                        .iter()
+                        .filter_map(|entry| {
+                            self.peers
+                                .values()
+                                .find(|other| {
+                                    other.player_id == entry.net_player_id && other.is_player()
+                                })
+                                .map(|other| {
+                                    (format!("{:?}", other.uuid), f32::from(entry.value) / 255.0)
+                                })
+                        })
+                        .collect();
+                    PlayerInfo {
+                        player_id: peer.player_id,
+                        uuid: format!("{:?}", peer.uuid),
+                        level_id: peer.level_id,
+                        position: peer.player_delta.position,
+                        velocity: peer.player_delta.velocity,
+                        state_at: peer.player_delta.state_at_ms,
+                        last_move_at: peer.last_seen_at_ms,
+                        affinity,
+                    }
                 })
                 .collect(),
         }

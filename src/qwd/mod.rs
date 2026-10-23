@@ -76,6 +76,13 @@ pub struct QwdClient {
     room_id: String,
     room_version: u64,
     telemetry_seq: u64,
+    /// Last player telemetry sent, used to build differential frames.
+    telemetry_roster: Option<HashMap<String, Value>>,
+    /// Sequence of the last telemetry frame actually sent.
+    last_telemetry_seq_sent: u64,
+    /// Sequence of the last full telemetry snapshot.
+    last_full_telemetry_seq: u64,
+    last_full_telemetry_at: Instant,
     draining: bool,
     internal_to_qwd: HashMap<u64, String>,
     qwd_moves: HashMap<String, PendingQwdMove>,
@@ -97,6 +104,10 @@ impl QwdClient {
                 reservations: Reservations::default(),
                 room_version: 1,
                 telemetry_seq: 0,
+                telemetry_roster: None,
+                last_telemetry_seq_sent: 0,
+                last_full_telemetry_seq: 0,
+                last_full_telemetry_at: Instant::now(),
                 draining: false,
                 internal_to_qwd: HashMap::new(),
                 qwd_moves: HashMap::new(),
@@ -138,6 +149,10 @@ impl QwdClient {
         self.qwd_moves.clear();
         self.room_version = 1;
         self.telemetry_seq = 0;
+        self.telemetry_roster = None;
+        self.last_telemetry_seq_sent = 0;
+        self.last_full_telemetry_seq = 0;
+        self.last_full_telemetry_at = Instant::now();
 
         self.send_node_ready(&mut socket)?;
         self.send_room_created(&mut socket)?;

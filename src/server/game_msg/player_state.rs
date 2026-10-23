@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 #![allow(unused)]
 
+use std::time::Instant;
+
 use crate::{
     protocol::{
         self,
@@ -9,6 +11,18 @@ use crate::{
     },
     utils::hex_preview,
 };
+
+/// PlayerState starts with `state_kind: u8` followed by three little-endian
+/// floats. That prefix has been stable across client revisions.
+fn decode_position(state: &[u8]) -> Option<[f32; 3]> {
+    let x = f32::from_le_bytes(state.get(1..5)?.try_into().ok()?);
+    let y = f32::from_le_bytes(state.get(5..9)?.try_into().ok()?);
+    let z = f32::from_le_bytes(state.get(9..13)?.try_into().ok()?);
+    [x, y, z]
+        .iter()
+        .all(|value| value.is_finite())
+        .then_some([x, y, z])
+}
 
 impl crate::server::state::ServerState {
     /// Handles player state
@@ -24,6 +38,28 @@ impl crate::server::state::ServerState {
         if save_seq != 0 {
             peer.player_delta.snapshot_ack = Some(save_seq);
         }
+
+        let now = Instant::now();
+        if let Some(position) = decode_position(&raw_state) {
+            if let Some((previous, previous_at)) = peer.player_delta.previous_position {
+                let dt = now.duration_since(previous_at).as_secs_f32();
+                if dt > 0.001 {
+                    let dx = position[0] - previous[0];
+                    let dy = position[1] - previous[1];
+                    let dz = position[2] - previous[2];
+                    // The native client reports a velocity vector; the raw
+                    // layout is version-specific, so approximate it from
+                    // consecutive positions and clamp level-change teleports.
+                    let speed = (dx * dx + dy * dy + dz * dz).sqrt() / dt;
+                    if speed.is_finite() {
+                        peer.player_delta.velocity = Some(speed.min(150.0));
+                    }
+                }
+            }
+            peer.player_delta.previous_position = Some((position, now));
+            peer.player_delta.position = Some(position);
+        }
+        peer.player_delta.state_at_ms = crate::server::peer::now_ms();
 
         peer.player_delta.raw_state.clear();
         peer.player_delta.raw_state.extend(raw_state);

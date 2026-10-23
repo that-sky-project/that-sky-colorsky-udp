@@ -1,9 +1,10 @@
 //! Outgoing QWD events and server-event bridging.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::TryRecvError;
+use std::time::{Duration, Instant};
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::control::{PlayerInfo, ServerEvent};
 
@@ -81,29 +82,81 @@ impl QwdClient {
 
     pub(super) fn send_telemetry(&mut self, socket: &mut Socket) -> Result<(), String> {
         let status = self.status()?;
-        let players: Vec<Value> = status
+        let capacity = self.config.capacity;
+        let load = if capacity == 0 {
+            0.0
+        } else {
+            (status.player_list.len() as f64 / capacity as f64).clamp(0.0, 1.0)
+        };
+
+        let current: HashMap<String, Value> = status
             .player_list
             .iter()
             .take(8)
-            .map(|player| {
-                json!({
-                    "playerId": player.uuid,
-                    "levelId": player.level_id,
-                    "stateAt": now_ms()
-                })
-            })
+            .map(|player| (player.uuid.clone(), player_telemetry(player)))
             .collect();
 
         self.telemetry_seq = self.telemetry_seq.wrapping_add(1);
-        let value = event(
-            "room.telemetry",
-            json!({
-                "roomId": self.room_id,
-                "seq": self.telemetry_seq,
-                "players": players,
-                "timestamp": now_ms()
-            }),
-        );
+        let seq = self.telemetry_seq;
+        let now = Instant::now();
+
+        // Full snapshots every 30 frames / 30 seconds let a manager recover
+        // from a missed delta; otherwise only changed players are uploaded.
+        let can_delta = self
+            .telemetry_roster
+            .as_ref()
+            .is_some_and(|roster| !roster.is_empty())
+            && seq.wrapping_sub(self.last_full_telemetry_seq) < 30
+            && now.duration_since(self.last_full_telemetry_at) < Duration::from_secs(30);
+
+        let mut data = Map::new();
+        data.insert("roomId".to_string(), json!(self.room_id));
+        data.insert("seq".to_string(), json!(seq));
+        data.insert("capacity".to_string(), json!(capacity));
+        data.insert("load".to_string(), json!(load));
+        data.insert("timestamp".to_string(), json!(now_ms()));
+
+        if can_delta {
+            let previous = self
+                .telemetry_roster
+                .as_ref()
+                .expect("roster checked above");
+            let mut changed = Vec::new();
+            for (player_id, value) in &current {
+                let changed_now = previous
+                    .get(player_id)
+                    .is_none_or(|old| !same_telemetry(old, value));
+                if changed_now {
+                    changed.push(value.clone());
+                }
+            }
+            let mut removed = Vec::new();
+            for player_id in previous.keys() {
+                if !current.contains_key(player_id) {
+                    removed.push(player_id.clone());
+                }
+            }
+
+            if changed.is_empty() && removed.is_empty() {
+                self.telemetry_roster = Some(current);
+                return Ok(());
+            }
+
+            data.insert("players".to_string(), Value::Array(changed));
+            data.insert("kind".to_string(), json!("delta"));
+            data.insert("baseSeq".to_string(), json!(self.last_telemetry_seq_sent));
+            data.insert("removedPlayers".to_string(), json!(removed));
+        } else {
+            let players: Vec<Value> = current.values().cloned().collect();
+            data.insert("players".to_string(), Value::Array(players));
+            self.last_full_telemetry_seq = seq;
+            self.last_full_telemetry_at = now;
+        }
+
+        self.telemetry_roster = Some(current);
+        self.last_telemetry_seq_sent = seq;
+
+        let value = event("room.telemetry", Value::Object(data));
         self.send_json(socket, &value)
     }
 
@@ -310,5 +363,81 @@ impl QwdClient {
             &state.failed,
             state.reason.as_deref(),
         )
+    }
+}
+
+/// Compare only the fields XYSKY uses to decide whether a player changed.
+/// Timestamps move on every packet and must not defeat delta compression.
+fn same_telemetry(a: &Value, b: &Value) -> bool {
+    a.get("levelId") == b.get("levelId")
+        && a.get("position") == b.get("position")
+        && a.get("velocity") == b.get("velocity")
+        && a.get("affinity") == b.get("affinity")
+}
+
+/// Shape one player's QWD telemetry entry. Optional fields mirror XYSKY, which
+/// omits them when the corresponding data is unavailable.
+fn player_telemetry(player: &PlayerInfo) -> Value {
+    let mut value = json!({
+        "playerId": player.uuid,
+        "levelId": player.level_id,
+    });
+    if player.state_at > 0 {
+        value["stateAt"] = json!(player.state_at);
+    }
+    if player.last_move_at > 0 {
+        value["lastMoveAt"] = json!(player.last_move_at);
+    }
+    if let Some(position) = player.position {
+        value["position"] = json!(position);
+    }
+    if let Some(velocity) = player.velocity {
+        value["velocity"] = json!(velocity);
+    }
+    let mut affinity = Map::new();
+    for (player_id, weight) in &player.affinity {
+        affinity.insert(player_id.clone(), json!(weight));
+    }
+    value["affinity"] = Value::Object(affinity);
+    value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{player_telemetry, same_telemetry};
+    use crate::control::PlayerInfo;
+    use serde_json::json;
+
+    fn player(level_id: u32) -> PlayerInfo {
+        PlayerInfo {
+            player_id: 1,
+            uuid: "player-1".to_string(),
+            level_id,
+            position: Some([1.0, 2.0, 3.0]),
+            velocity: Some(4.0),
+            state_at: 100,
+            last_move_at: 200,
+            affinity: vec![("player-2".to_string(), 0.5)],
+        }
+    }
+
+    #[test]
+    fn telemetry_comparison_ignores_timestamps() {
+        let mut newer = player(7);
+        newer.state_at = 300;
+        newer.last_move_at = 400;
+
+        let base = player_telemetry(&player(7));
+        assert!(same_telemetry(&base, &player_telemetry(&newer)));
+        assert!(!same_telemetry(&base, &player_telemetry(&player(8))));
+    }
+
+    #[test]
+    fn telemetry_entry_matches_qwd_shape() {
+        let value = player_telemetry(&player(7));
+        assert_eq!(value["levelId"], json!(7));
+        assert_eq!(value["position"], json!([1.0, 2.0, 3.0]));
+        assert_eq!(value["velocity"], json!(4.0));
+        assert_eq!(value["affinity"]["player-2"], json!(0.5));
     }
 }

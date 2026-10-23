@@ -4,10 +4,11 @@
 //! connection — both the raw peer pointer for sending and the full
 //! runtime state.
 
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use enet_sys::ENetPeer;
 
+use crate::protocol::game_msg::affinity::AffinityEntry;
 use crate::protocol::types::TgcUuid;
 use crate::utils::snapshot::{SnapshotReader, SnapshotWriter};
 
@@ -31,6 +32,14 @@ pub struct PlayerState {
     pub snap_reader: SnapshotReader,
     pub snap_writer: SnapshotWriter,
     pub snapshot_ack: Option<u8>,
+    /// Latest position decoded from the raw PlayerState header.
+    pub position: Option<[f32; 3]>,
+    /// Approximate speed derived from consecutive positions.
+    pub velocity: Option<f32>,
+    /// Unix milliseconds of the last successfully decoded PlayerState.
+    pub state_at_ms: u64,
+    /// Previous position and observation time, used to derive velocity.
+    pub(crate) previous_position: Option<([f32; 3], Instant)>,
 }
 
 impl PlayerState {
@@ -40,6 +49,10 @@ impl PlayerState {
             snap_reader: SnapshotReader::new(),
             snap_writer: SnapshotWriter::with_label("player_state"),
             snapshot_ack: None,
+            position: None,
+            velocity: None,
+            state_at_ms: 0,
+            previous_position: None,
         }
     }
 }
@@ -84,10 +97,22 @@ pub struct PeerEntry {
     /// Connection token bound by the first `JoinGame` packet. Every later
     /// client packet must carry the same token.
     pub conn_magic: Option<u32>,
+    /// Unix milliseconds of the last packet received from this client.
+    pub last_seen_at_ms: u64,
+    /// Latest client affinity entries, keyed by net player id.
+    pub affinity: Vec<AffinityEntry>,
     /// Player State
     pub player_delta: PlayerState,
     /// Level Data
     pub level_delta: LevelDelta,
+}
+
+/// Current Unix time in milliseconds.
+pub(crate) fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl PeerEntry {
@@ -103,6 +128,8 @@ impl PeerEntry {
             state: PeerState::Pending,
             connected_at: Instant::now(),
             conn_magic: None,
+            last_seen_at_ms: now_ms(),
+            affinity: Vec::new(),
             player_delta: PlayerState::new(),
             level_delta: LevelDelta::new(),
         }

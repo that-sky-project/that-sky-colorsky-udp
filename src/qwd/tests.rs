@@ -111,6 +111,11 @@ fn registers_and_answers_qwd_commands() {
         player_id: 1,
         uuid: player_id.clone(),
         level_id: 0,
+        position: None,
+        velocity: None,
+        state_at: 0,
+        last_move_at: 0,
+        affinity: Vec::new(),
     }));
     let (event_tx, event_rx) = mpsc::sync_channel(32);
     let event_tx_for_server = event_tx.clone();

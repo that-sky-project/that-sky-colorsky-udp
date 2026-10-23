@@ -9,7 +9,7 @@ impl crate::server::state::ServerState {
     /// This message is client-to-server only in the current client, so it is
     /// consumed and never relayed to other players.
     pub(super) fn handle_affinity(&mut self, peer_key: usize, msg: GameMsg) -> Option<()> {
-        let peer = self.peers.get(&peer_key)?;
+        let peer = self.peers.get_mut(&peer_key)?;
         let affinity = Affinity::from_bytes(&msg.payload)?;
 
         tracing::debug!(
@@ -20,6 +20,9 @@ impl crate::server::state::ServerState {
             entries = ?affinity.entries,
             "consumed client affinity update"
         );
+
+        // Exposed to adapters (QWD telemetry) as a UUID-keyed map.
+        peer.affinity = affinity.entries;
 
         Some(())
     }
