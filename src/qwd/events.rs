@@ -128,10 +128,6 @@ impl QwdClient {
         move_id: &str,
         player_ids: &[String],
     ) -> Result<(), String> {
-        if !self.room_active {
-            return Ok(());
-        }
-
         let value = event(
             "move.completed",
             json!({
@@ -152,10 +148,6 @@ impl QwdClient {
         move_id: &str,
         player_ids: &[String],
     ) -> Result<(), String> {
-        if !self.room_active {
-            return Ok(());
-        }
-
         let value = event(
             "reservation.expired",
             json!({
