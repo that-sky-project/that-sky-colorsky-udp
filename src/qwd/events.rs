@@ -12,6 +12,12 @@ use super::protocol::event;
 use super::util::now_ms;
 use super::{PendingQwdMove, QwdClient, Socket};
 
+/// A full telemetry snapshot is re-sent at least this often even when nothing
+/// changed. It re-syncs a manager whose delta base drifted and gives the
+/// planner an idle liveness signal.
+const TELEMETRY_FULL_RESYNC_FRAMES: u64 = 30;
+const TELEMETRY_FULL_RESYNC_MS: u64 = 30_000;
+
 impl QwdClient {
     pub(super) fn send_node_ready(&self, socket: &mut Socket) -> Result<(), String> {
         let players = self
@@ -94,18 +100,20 @@ impl QwdClient {
             .map(|player| (player.uuid.clone(), player_telemetry(player)))
             .collect();
 
-        self.telemetry_seq = self.telemetry_seq.wrapping_add(1);
-        let seq = self.telemetry_seq;
+        // Only advance the sequence when a frame is actually published. The
+        // manager derives the room version (and therefore `expectedVersion` in
+        // move.prepare) from the last seq it received; advancing through idle
+        // ticks makes every later move look stale.
+        let seq = self.telemetry_seq.wrapping_add(1);
         let now = Instant::now();
 
-        // Full snapshots every 30 frames / 30 seconds let a manager recover
-        // from a missed delta; otherwise only changed players are uploaded.
         let can_delta = self
             .telemetry_roster
             .as_ref()
             .is_some_and(|roster| !roster.is_empty())
-            && seq.wrapping_sub(self.last_full_telemetry_seq) < 30
-            && now.duration_since(self.last_full_telemetry_at) < Duration::from_secs(30);
+            && seq.wrapping_sub(self.last_full_telemetry_seq) < TELEMETRY_FULL_RESYNC_FRAMES
+            && now.duration_since(self.last_full_telemetry_at)
+                < Duration::from_millis(TELEMETRY_FULL_RESYNC_MS);
 
         let mut data = Map::new();
         data.insert("roomId".to_string(), json!(self.room_id));
@@ -136,6 +144,9 @@ impl QwdClient {
             }
 
             if changed.is_empty() && removed.is_empty() {
+                // Nothing observable changed, so no frame is published and the
+                // sequence must not advance: the manager's cached room version
+                // has to stay equal to the last seq it actually received.
                 self.telemetry_roster = Some(current);
                 return Ok(());
             }
@@ -151,6 +162,7 @@ impl QwdClient {
             self.last_full_telemetry_at = now;
         }
 
+        self.telemetry_seq = seq;
         self.telemetry_roster = Some(current);
         self.last_telemetry_seq_sent = seq;
 
