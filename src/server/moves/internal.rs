@@ -6,7 +6,7 @@ use crate::control::{ControlResponse, RoomEndpoint, ServerEvent};
 use crate::protocol::game_msg::{GameMsg, GameMsgId};
 use crate::protocol::packet::Packet;
 use crate::protocol::packet::PacketId;
-use crate::protocol::packet::move_game::{Move, MoveGame};
+use crate::protocol::packet::move_game::{Move, MoveGame, NO_EVENT_RESERVATION};
 use crate::protocol::types::TgcUuid;
 
 use super::super::peer::PeerState;
@@ -55,7 +55,7 @@ impl ServerState {
             },
             u32_field: 0,
             u08_field: 0,
-            u32_field2: 0,
+            u32_field2: NO_EVENT_RESERVATION,
             is_split: false,
             destination_uuid: target.uuid.unwrap_or_default(),
         };
@@ -158,7 +158,7 @@ impl ServerState {
                 },
                 u32_field: 0,
                 u08_field: 0,
-                u32_field2: 0,
+                u32_field2: NO_EVENT_RESERVATION,
                 is_split: true,
                 destination_uuid: target.uuid.unwrap_or_default(),
             };
