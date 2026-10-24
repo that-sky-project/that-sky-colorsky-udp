@@ -1,6 +1,7 @@
 use crate::protocol::{self, packet::PacketId};
 use crate::server::peer::PeerState;
 
+mod disconnect;
 mod join;
 mod level_update;
 mod ping;
@@ -17,7 +18,7 @@ impl crate::server::state::ServerState {
             PeerState::Pending => {
                 matches!(
                     packet.packet_id,
-                    PacketId::ClientConnect | PacketId::JoinGame
+                    PacketId::ClientConnect | PacketId::JoinGame | PacketId::Disconnect
                 )
             }
             PeerState::Active => matches!(
@@ -26,8 +27,12 @@ impl crate::server::state::ServerState {
                     | PacketId::GameMsg
                     | PacketId::NetTimePing
                     | PacketId::MoveResult
+                    | PacketId::Disconnect
             ),
-            PeerState::Moving => matches!(packet.packet_id, PacketId::MoveResult),
+            PeerState::Moving => matches!(
+                packet.packet_id,
+                PacketId::MoveResult | PacketId::Disconnect
+            ),
             PeerState::Closed => false,
         };
 
@@ -66,6 +71,11 @@ impl crate::server::state::ServerState {
             // Result of a cross-room move request.
             PacketId::MoveResult => {
                 self.handle_move_result(peer_key, &packet.payload);
+            }
+
+            // Client-initiated disconnect, with its own reason byte.
+            PacketId::Disconnect => {
+                self.handle_client_disconnect(peer_key, &packet.payload);
             }
 
             // GameMsg need handle by the game_msg module.

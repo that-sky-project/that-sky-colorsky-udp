@@ -90,6 +90,21 @@ impl ServerState {
             },
         );
 
+        // Log every redirect: a client that receives a second MoveGame while it
+        // is still finishing the previous one aborts the move (ENet disconnect
+        // data 33), so this is the first thing to check when a moved player
+        // drops right after joining.
+        tracing::info!(
+            "[ENET:MOVE] sent MoveGame player={} move_id={} uuid={:?} level={:#x} room={} destination={} destination_uuid={:?}",
+            player_id,
+            move_id,
+            uuid,
+            level_id,
+            target.id,
+            target.address,
+            target.uuid
+        );
+
         if let Some(peer) = self.peers.get_mut(&peer_key) {
             peer.state = PeerState::Moving;
         }
@@ -195,6 +210,17 @@ impl ServerState {
         for (index, (move_id, player_id, uuid, level_id, nonce)) in prepared.into_iter().enumerate()
         {
             let peer_key = members[index].0;
+            tracing::info!(
+                "[ENET:MOVE] sent MoveGame player={} move_id={} uuid={:?} level={:#x} group={} room={} destination={} destination_uuid={:?}",
+                player_id,
+                move_id,
+                uuid,
+                level_id,
+                player_ids.len(),
+                target.id,
+                target.address,
+                target.uuid
+            );
             self.pending_moves.insert(
                 move_id,
                 PendingMove {
