@@ -13,10 +13,16 @@ use super::util::now_ms;
 use super::{PendingQwdMove, QwdClient, Socket};
 
 /// A full telemetry snapshot is re-sent at least this often even when nothing
-/// changed. It re-syncs a manager whose delta base drifted and gives the
-/// planner an idle liveness signal.
+/// changed. Besides re-syncing a manager whose delta base drifted, this bounds
+/// how long a dropped delta can leave the manager's room version frozen (a
+/// frozen version makes every later move.prepare look like a STALE_PLAN).
 const TELEMETRY_FULL_RESYNC_FRAMES: u64 = 30;
-const TELEMETRY_FULL_RESYNC_MS: u64 = 30_000;
+const TELEMETRY_FULL_RESYNC_MS: u64 = 10_000;
+/// An unchanged player is re-sent at least this often. Without it a room whose
+/// players stand still publishes nothing between full resyncs: the manager ages
+/// the node out of its healthy set and freezes `stateAt`, while an empty room
+/// (which always sends a full frame) stays visible.
+const TELEMETRY_PLAYER_KEEPALIVE_MS: u64 = 2_000;
 
 impl QwdClient {
     pub(super) fn send_node_ready(&self, socket: &mut Socket) -> Result<(), String> {
@@ -62,28 +68,6 @@ impl QwdClient {
         self.send_json(socket, &value)
     }
 
-    pub(super) fn replay_players(&mut self, socket: &mut Socket) -> Result<(), String> {
-        let status = self.status()?;
-        for player in status.player_list {
-            self.send_player_join(socket, &player)?;
-        }
-        Ok(())
-    }
-
-    fn send_player_join(&mut self, socket: &mut Socket, player: &PlayerInfo) -> Result<(), String> {
-        let value = event(
-            "player.join",
-            json!({
-                "roomId": self.room_id,
-                "player": {
-                    "playerId": player.uuid,
-                    "level": player.level_id
-                }
-            }),
-        );
-        self.send_json(socket, &value)
-    }
-
     pub(super) fn send_telemetry(&mut self, socket: &mut Socket) -> Result<(), String> {
         let status = self.status()?;
         let capacity = self.config.capacity;
@@ -107,10 +91,11 @@ impl QwdClient {
         let seq = self.telemetry_seq.wrapping_add(1);
         let now = Instant::now();
 
-        let can_delta = self
-            .telemetry_roster
-            .as_ref()
-            .is_some_and(|roster| !roster.is_empty())
+        let can_delta = self.caps.delta_telemetry
+            && self
+                .telemetry_roster
+                .as_ref()
+                .is_some_and(|roster| !roster.is_empty())
             && seq.wrapping_sub(self.last_full_telemetry_seq) < TELEMETRY_FULL_RESYNC_FRAMES
             && now.duration_since(self.last_full_telemetry_at)
                 < Duration::from_millis(TELEMETRY_FULL_RESYNC_MS);
@@ -127,12 +112,19 @@ impl QwdClient {
                 .telemetry_roster
                 .as_ref()
                 .expect("roster checked above");
+            let sent = &self.last_telemetry_sent_at;
             let mut changed = Vec::new();
             for (player_id, value) in &current {
                 let changed_now = previous
                     .get(player_id)
                     .is_none_or(|old| !same_telemetry(old, value));
-                if changed_now {
+                // Keepalive: an idle player is re-sent even though nothing
+                // observable changed, so the manager keeps a fresh `stateAt`
+                // and does not age this node out of its healthy set.
+                let stale = sent.get(player_id).is_none_or(|at| {
+                    now.duration_since(*at) >= Duration::from_millis(TELEMETRY_PLAYER_KEEPALIVE_MS)
+                });
+                if changed_now || stale {
                     changed.push(value.clone());
                 }
             }
@@ -144,22 +136,37 @@ impl QwdClient {
             }
 
             if changed.is_empty() && removed.is_empty() {
-                // Nothing observable changed, so no frame is published and the
-                // sequence must not advance: the manager's cached room version
-                // has to stay equal to the last seq it actually received.
+                // Nothing observable changed and every player was on the wire
+                // recently, so no frame is published and the sequence must not
+                // advance: the manager's cached room version has to stay equal
+                // to the last seq it actually received.
                 self.telemetry_roster = Some(current);
                 return Ok(());
             }
 
-            data.insert("players".to_string(), Value::Array(changed));
+            data.insert("players".to_string(), Value::Array(changed.clone()));
             data.insert("kind".to_string(), json!("delta"));
             data.insert("baseSeq".to_string(), json!(self.last_telemetry_seq_sent));
             data.insert("removedPlayers".to_string(), json!(removed));
+
+            for player in &changed {
+                if let Some(player_id) = player.get("playerId").and_then(Value::as_str) {
+                    self.last_telemetry_sent_at
+                        .insert(player_id.to_string(), now);
+                }
+            }
+            for player_id in &removed {
+                self.last_telemetry_sent_at.remove(player_id);
+            }
         } else {
             let players: Vec<Value> = current.values().cloned().collect();
             data.insert("players".to_string(), Value::Array(players));
             self.last_full_telemetry_seq = seq;
             self.last_full_telemetry_at = now;
+            self.last_telemetry_sent_at = current
+                .keys()
+                .map(|player_id| (player_id.clone(), now))
+                .collect();
         }
 
         self.telemetry_seq = seq;
@@ -191,6 +198,12 @@ impl QwdClient {
         move_id: &str,
         player_ids: &[String],
     ) -> Result<(), String> {
+        if !self.caps.move_completed {
+            // Older managers have no `move.completed` event and settle the
+            // transaction from the join/leave pair instead. A positive
+            // `move.result` is the strongest signal they do understand.
+            return self.send_move_result(socket, move_id, true, player_ids, &[], None);
+        }
         let value = event(
             "move.completed",
             json!({
@@ -211,6 +224,11 @@ impl QwdClient {
         move_id: &str,
         player_ids: &[String],
     ) -> Result<(), String> {
+        if !self.caps.reservation_expired {
+            // Older managers reject the event and run their own reservation
+            // TTL, so sending it only produces a rejection per expired move.
+            return Ok(());
+        }
         let value = event(
             "reservation.expired",
             json!({

@@ -6,6 +6,7 @@
 //! messages.
 
 mod commands;
+mod compat;
 mod events;
 mod protocol;
 mod reservations;
@@ -24,8 +25,11 @@ use tungstenite::{Error as WsError, Message, WebSocket, connect};
 
 use crate::control::{ControlHandle, ControlResponse, ServerEvent, ServerStatus};
 
+use compat::ManagerCaps;
 use reservations::Reservations;
-use util::{control_error, endpoint_url, generate_room_id, init_tls, set_read_timeout};
+use util::{
+    control_error, endpoint_url, generate_node_id, generate_room_id, init_tls, set_read_timeout,
+};
 
 type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
 type AckParts = (i64, Option<String>, Option<Value>);
@@ -73,10 +77,16 @@ pub struct QwdClient {
     control: ControlHandle,
     events: Receiver<ServerEvent>,
     reservations: Reservations,
+    /// Stable node identity reported as `?node=` so a reconnect can be matched
+    /// to the connection it replaces.
+    node_id: String,
     room_id: String,
     telemetry_seq: u64,
     /// Last player telemetry sent, used to build differential frames.
     telemetry_roster: Option<HashMap<String, Value>>,
+    /// When each player last appeared on the wire, used to keep idle players
+    /// fresh for the manager's planner.
+    last_telemetry_sent_at: HashMap<String, Instant>,
     /// Sequence of the last telemetry frame actually sent.
     last_telemetry_seq_sent: u64,
     /// Sequence of the last full telemetry snapshot.
@@ -84,6 +94,9 @@ pub struct QwdClient {
     last_full_telemetry_at: Instant,
     /// Last manager error signature, to avoid repeating the same warning.
     last_manager_error: Option<String>,
+    /// Events the connected manager accepts. Older builds reject the newest
+    /// ones, so the adapter degrades instead of losing every frame.
+    caps: ManagerCaps,
     draining: bool,
     internal_to_qwd: HashMap<u64, String>,
     qwd_moves: HashMap<String, PendingQwdMove>,
@@ -99,16 +112,19 @@ impl QwdClient {
         thread::spawn(move || {
             Self {
                 room_id: generate_room_id(),
+                node_id: generate_node_id(),
                 config,
                 control,
                 events,
                 reservations: Reservations::default(),
                 telemetry_seq: 0,
                 telemetry_roster: None,
+                last_telemetry_sent_at: HashMap::new(),
                 last_telemetry_seq_sent: 0,
                 last_full_telemetry_seq: 0,
                 last_full_telemetry_at: Instant::now(),
                 last_manager_error: None,
+                caps: ManagerCaps::default(),
                 draining: false,
                 internal_to_qwd: HashMap::new(),
                 qwd_moves: HashMap::new(),
@@ -127,14 +143,14 @@ impl QwdClient {
             self.reservations.clear();
             self.internal_to_qwd.clear();
             self.qwd_moves.clear();
-            while self.events.try_recv().is_ok() {}
+            self.discard_queued_events();
             thread::sleep(self.config.reconnect_delay);
         }
     }
 
     fn connect_once(&mut self) -> Result<(), String> {
         init_tls();
-        let endpoint = endpoint_url(&self.config.url)?;
+        let endpoint = endpoint_url(&self.config.url, &self.node_id)?;
         let (mut socket, _) = connect(endpoint.as_str()).map_err(|error| error.to_string())?;
         set_read_timeout(&mut socket, Some(Duration::from_millis(250)))
             .map_err(|error| error.to_string())?;
@@ -142,6 +158,7 @@ impl QwdClient {
         tracing::info!(
             endpoint = %endpoint,
             room_id = %self.room_id,
+            node_id = %self.node_id,
             "[QWD] connected"
         );
 
@@ -153,14 +170,19 @@ impl QwdClient {
         // so a reconnect must continue from the previous value. Only
         // `room.id_conflict` (which generates a new room id) resets it.
         self.telemetry_roster = None;
+        self.last_telemetry_sent_at.clear();
         self.last_telemetry_seq_sent = 0;
         self.last_full_telemetry_seq = 0;
         self.last_full_telemetry_at = Instant::now();
         self.last_manager_error = None;
 
         self.send_node_ready(&mut socket)?;
+        // No per-player `player.join` replay: the manager restores membership
+        // from `room.created` (which carries the authoritative player count)
+        // plus the full telemetry snapshot below. Replaying joins bumps the
+        // manager's occupancy once per player and double-counts rooms that
+        // survived in its grace window.
         self.send_room_created(&mut socket)?;
-        self.replay_players(&mut socket)?;
         if self.draining {
             self.send_node_draining(&mut socket)?;
         }
@@ -206,6 +228,22 @@ impl QwdClient {
         socket
             .send(Message::text(text))
             .map_err(|error| error.to_string())
+    }
+
+    /// Drop events that queued up while the socket was down. They describe a
+    /// state the manager has already lost, and the reconnect replays the
+    /// authoritative snapshot below.
+    fn discard_queued_events(&mut self) {
+        let mut discarded = 0usize;
+        while self.events.try_recv().is_ok() {
+            discarded += 1;
+        }
+        if discarded > 0 {
+            tracing::warn!(
+                discarded,
+                "[QWD] discarded events queued while the manager was offline"
+            );
+        }
     }
 
     pub(super) fn status(&self) -> Result<ServerStatus, String> {

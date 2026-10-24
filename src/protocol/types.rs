@@ -22,7 +22,9 @@ impl TgcUuid {
         self.0
     }
 
-    /// Parse a hyphenated UUID string (the format used by QWD room ids).
+    /// Parse a hyphenated UUID string (player uuids and the `MoveGame`
+    /// destination id). QWD room ids are short decimal numbers and do not
+    /// parse here; the QWD adapter maps those to a uuid itself.
     pub fn parse(value: &str) -> Option<Self> {
         let mut bytes = [0u8; 16];
         let mut index = 0usize;

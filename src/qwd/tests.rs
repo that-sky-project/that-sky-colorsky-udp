@@ -14,26 +14,49 @@ use crate::control::{
 };
 use crate::protocol::types::TgcUuid;
 
-use super::util::{endpoint_url, generate_room_id};
+use super::util::{destination_uuid, endpoint_url, generate_room_id};
 use super::{QwdClient, QwdConfig};
 #[test]
 fn endpoint_forces_root_and_protocol_version() {
     assert_eq!(
-        endpoint_url("ws://127.0.0.1:1131").unwrap(),
-        "ws://127.0.0.1:1131/?v=1"
+        endpoint_url("ws://127.0.0.1:1131", "node-1").unwrap(),
+        "ws://127.0.0.1:1131/?v=1&node=node-1"
     );
     assert_eq!(
-        endpoint_url("wss://manager.example/ignored/path").unwrap(),
-        "wss://manager.example/?v=1"
+        endpoint_url("wss://manager.example/ignored/path", "node-1").unwrap(),
+        "wss://manager.example/?v=1&node=node-1"
     );
-    assert!(endpoint_url("manager.example:1131").is_err());
+    assert!(endpoint_url("manager.example:1131", "node-1").is_err());
 }
 
 #[test]
-fn generated_room_id_is_uuid_shaped() {
-    let room_id = generate_room_id();
-    assert_eq!(room_id.len(), 36);
-    assert_eq!(room_id.chars().filter(|ch| *ch == '-').count(), 4);
+fn destination_uuid_matches_node_convention() {
+    // Mirrors XYSKY's RoomServer.destinationUuid and the manager's
+    // CrossCoordinator.destinationUuidText.
+    let uuid = destination_uuid("12345678").expect("numeric id maps to a uuid");
+    assert_eq!(format!("{uuid:?}"), "00000000-0000-4000-8000-000000bc614e");
+
+    // UUID-shaped ids pass through so mixed-version clusters keep working.
+    let text = "0d17e2c6-cdbd-40a5-983d-b9deb380dd00";
+    assert_eq!(format!("{:?}", destination_uuid(text).unwrap()), text);
+
+    for invalid in ["", "0x10", "1e3", "1234567890123456", "-1"] {
+        assert!(destination_uuid(invalid).is_none(), "{invalid}");
+    }
+}
+
+#[test]
+fn generated_room_id_is_decimal() {
+    for _ in 0..16 {
+        let room_id = generate_room_id();
+        assert_eq!(room_id.len(), 8, "{room_id}");
+        assert!(
+            room_id.bytes().all(|byte| byte.is_ascii_digit()),
+            "{room_id}"
+        );
+        let numeric: u32 = room_id.parse().unwrap();
+        assert!((10_000_000..=99_999_999).contains(&numeric), "{room_id}");
+    }
 }
 
 fn spawn_fake_control(player: Option<PlayerInfo>) -> ControlHandle {
@@ -104,6 +127,82 @@ fn send_command(socket: &mut WebSocket<TcpStream>, value: Value) {
 }
 
 #[test]
+fn falls_back_to_move_result_on_old_managers() {
+    let player_uuid = TgcUuid::from(&[7u8; 16]).unwrap();
+    let player_id = format!("{player_uuid:?}");
+    // No players in the room yet: `move.prepare` must accept the group.
+    let control = spawn_fake_control(None);
+    let (event_tx, event_rx) = mpsc::sync_channel(32);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let mut config = QwdConfig::new(format!("ws://127.0.0.1:{port}"), "127.0.0.1", 5413, 8);
+    config.reconnect_delay = Duration::from_secs(60);
+
+    let _client = QwdClient::spawn(config, control, event_rx);
+
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut socket = accept(stream).unwrap();
+
+        assert_eq!(read_json(&mut socket)["event"], "node.ready");
+        let room_id = read_json(&mut socket)["data"]["roomId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Older manager build: `move.completed` is not part of its schema.
+        send_command(
+            &mut socket,
+            json!({
+                "code": 5999,
+                "data": {
+                    "message": r#"[{"received":"move.completed","code":"invalid_enum_value","path":["event"],"message":"Invalid enum value"}]"#
+                }
+            }),
+        );
+
+        send_command(
+            &mut socket,
+            json!({
+                "v": 1,
+                "id": 21,
+                "cmd": "move.prepare",
+                "data": {
+                    "moveId": "move-old",
+                    "roomId": room_id,
+                    "playerIds": [player_id.clone()],
+                    "ttlMs": 5000
+                }
+            }),
+        );
+        assert_eq!(read_ack(&mut socket, 21)["code"], 0);
+
+        event_tx
+            .send(ServerEvent::PlayerJoined {
+                player_id: 1,
+                uuid: player_uuid,
+                level_id: 42,
+            })
+            .unwrap();
+
+        let result = read_event(&mut socket, "move.result");
+        assert_eq!(result["data"]["moveId"], "move-old");
+        assert_eq!(result["data"]["accepted"], true);
+        assert_eq!(result["data"]["movedPlayerIds"], json!([player_id]));
+        assert!(result["data"].get("playerIds").is_none());
+
+        socket.close(None).ok();
+    });
+
+    server.join().unwrap();
+}
+
+#[test]
 fn registers_and_answers_qwd_commands() {
     let player_uuid = TgcUuid::from(&[9u8; 16]).unwrap();
     let player_id = format!("{player_uuid:?}");
@@ -140,8 +239,8 @@ fn registers_and_answers_qwd_commands() {
         let created = read_json(&mut socket);
         assert_eq!(created["event"], "room.created");
         let room_id = created["data"]["roomId"].as_str().unwrap().to_string();
-        assert_eq!(room_id.len(), 36);
-        assert_eq!(room_id.chars().filter(|ch| *ch == '-').count(), 4);
+        assert_eq!(room_id.len(), 8);
+        assert!(room_id.bytes().all(|byte| byte.is_ascii_digit()));
 
         // Force a few read timeouts before sending the first command; the
         // adapter must keep the socket usable after `WouldBlock`.

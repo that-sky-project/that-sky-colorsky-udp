@@ -14,7 +14,7 @@ use super::protocol::{
     BAD_REQUEST, CONFLICT, INTERNAL, ManagerCommand, NO_CAPACITY, NODE_UNAVAILABLE, NOT_FOUND, OK,
     ack, event,
 };
-use super::util::{control_error, generate_room_id, now_ms};
+use super::util::{control_error, destination_uuid, generate_room_id, now_ms};
 use super::{AckParts, PendingQwdMove, QwdClient, Socket};
 
 impl QwdClient {
@@ -36,6 +36,14 @@ impl QwdClient {
                 .pointer("/data/message")
                 .and_then(Value::as_str)
                 .unwrap_or("");
+            let disabled = self.caps.observe_rejection(message);
+            if !disabled.is_empty() {
+                tracing::warn!(
+                    features = ?disabled,
+                    code = ?code,
+                    "[QWD] manager is an older build; disabling unsupported events"
+                );
+            }
             let signature = format!("{code:?}:{message}");
             if self.last_manager_error.as_deref() != Some(signature.as_str()) {
                 tracing::warn!(
@@ -117,14 +125,18 @@ impl QwdClient {
         // New room id, so its telemetry sequence starts over.
         self.telemetry_seq = 0;
         self.telemetry_roster = None;
+        self.last_telemetry_sent_at.clear();
         self.last_telemetry_seq_sent = 0;
         self.last_full_telemetry_seq = 0;
         self.last_full_telemetry_at = Instant::now();
         self.last_manager_error = None;
 
         tracing::warn!(room_id = %self.room_id, "[QWD] room id conflict; regenerated room id");
-        self.send_room_created(socket)?;
-        self.replay_players(socket)
+        // The new room id is unknown to the manager, so `room.created` (with
+        // its authoritative player count) plus the full telemetry frame that
+        // follows is all it needs. Replaying `player.join` here would bump the
+        // room's occupancy once per player.
+        self.send_room_created(socket)
     }
 
     fn handle_room_reserve(&mut self, command: &ManagerCommand) -> Result<AckParts, String> {
@@ -232,7 +244,10 @@ impl QwdClient {
             // state below; the manager will catch up on its own.
             let current = self.last_telemetry_seq_sent;
             if expected < current {
-                tracing::info!(
+                // Normal against managers that do not derive their room version
+                // from our telemetry seq. The live state is validated below, so
+                // keep this out of the default log level.
+                tracing::debug!(
                     move_id = %move_id,
                     expected_version = expected,
                     current_version = current,
@@ -330,7 +345,16 @@ impl QwdClient {
         // The client needs the destination room UUID in MoveGame to complete
         // the transfer; a zero UUID makes it drop the connection instead of
         // joining the target node.
-        let Some(destination_uuid) = TgcUuid::parse(to_room_id) else {
+        //
+        // The manager may send `toRoomUuid` explicitly (newer builds do) or
+        // only the room id. Nodes now use 8-digit decimal room ids, which are
+        // not `TgcUuid` text, so derive the same deterministic uuid every node
+        // uses for that id instead of rejecting the move.
+        let destination = command
+            .string_field("toRoomUuid")
+            .and_then(TgcUuid::parse)
+            .or_else(|| destination_uuid(to_room_id));
+        let Some(destination) = destination else {
             return Ok((
                 BAD_REQUEST,
                 Some("invalid destination room uuid".to_string()),
@@ -396,7 +420,7 @@ impl QwdClient {
         let room = RoomEndpoint {
             id: to_room_id.to_string(),
             address: NetAddress::new(host, udp_port as u16),
-            uuid: Some(destination_uuid),
+            uuid: Some(destination),
             capacity: 8,
             players: 0,
         };
