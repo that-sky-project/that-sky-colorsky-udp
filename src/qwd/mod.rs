@@ -8,8 +8,11 @@
 mod commands;
 mod compat;
 mod events;
+mod facts;
+mod move_commit;
 mod protocol;
 mod reservations;
+mod settle;
 mod util;
 
 use std::collections::{HashMap, HashSet};
@@ -69,6 +72,9 @@ struct PendingQwdMove {
     moved: Vec<String>,
     failed: Vec<String>,
     reason: Option<String>,
+    /// Reservation token echoed on `move.result`; the manager ignores settle
+    /// events whose token does not match its transaction.
+    token: Option<String>,
 }
 
 /// QWD node client. Use [`QwdClient::spawn`] to start it.
@@ -97,6 +103,9 @@ pub struct QwdClient {
     /// Events the connected manager accepts. Older builds reject the newest
     /// ones, so the adapter degrades instead of losing every frame.
     caps: ManagerCaps,
+    /// Set by `room.sync`: the next telemetry tick must publish a full frame
+    /// even if the differential roster would normally skip it.
+    force_full: bool,
     draining: bool,
     internal_to_qwd: HashMap<u64, String>,
     qwd_moves: HashMap<String, PendingQwdMove>,
@@ -125,6 +134,7 @@ impl QwdClient {
                 last_full_telemetry_at: Instant::now(),
                 last_manager_error: None,
                 caps: ManagerCaps::default(),
+                force_full: false,
                 draining: false,
                 internal_to_qwd: HashMap::new(),
                 qwd_moves: HashMap::new(),
@@ -194,8 +204,8 @@ impl QwdClient {
 
             if last_telemetry.elapsed() >= Duration::from_secs(1) {
                 let expired = self.reservations.expire(Instant::now());
-                for (move_id, player_ids) in expired {
-                    self.send_reservation_expired(&mut socket, &move_id, &player_ids)?;
+                for expired_move in &expired {
+                    self.send_reservation_expired(&mut socket, expired_move)?;
                 }
                 self.send_telemetry(&mut socket)?;
                 last_telemetry = Instant::now();

@@ -120,6 +120,10 @@ pub struct PlayerInfo {
     pub player_id: u8,
     pub uuid: String,
     pub level_id: u32,
+    /// Level generation the client last reported; needed for QWD telemetry.
+    pub lv_seq: u8,
+    /// Whether the client is mid-migration (MoveGame sent, result pending).
+    pub moving: bool,
     /// Last position decoded from the client's PlayerState header.
     pub position: Option<[f32; 3]>,
     /// Approximate speed in units per second from consecutive positions.

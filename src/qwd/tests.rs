@@ -210,6 +210,8 @@ fn registers_and_answers_qwd_commands() {
         player_id: 1,
         uuid: player_id.clone(),
         level_id: 0,
+        lv_seq: 0,
+        moving: false,
         position: None,
         velocity: None,
         state_at: 0,

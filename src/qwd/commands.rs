@@ -1,21 +1,18 @@
 //! QWD command handling.
 
-use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
 use std::time::Instant;
 
 use serde_json::{Value, json};
 
-use crate::control::{ControlCommand, ControlResponse, RoomEndpoint};
-use crate::protocol::net_address::NetAddress;
-use crate::protocol::types::TgcUuid;
+use crate::control::ControlCommand;
 
+use super::facts::with_facts;
 use super::protocol::{
-    BAD_REQUEST, CONFLICT, INTERNAL, ManagerCommand, NO_CAPACITY, NODE_UNAVAILABLE, NOT_FOUND, OK,
-    ack, event,
+    BAD_REQUEST, CONFLICT, INTERNAL, ManagerCommand, NO_CAPACITY, NOT_FOUND, OK, ack, event,
 };
-use super::util::{control_error, destination_uuid, generate_room_id, now_ms};
-use super::{AckParts, PendingQwdMove, QwdClient, Socket};
+use super::reservations::{ReserveMoveError, matches_token};
+use super::util::{control_error, generate_room_id, now_ms};
+use super::{AckParts, QwdClient, Socket};
 
 impl QwdClient {
     pub(super) fn handle_command(&mut self, socket: &mut Socket, text: &str) -> Result<(), String> {
@@ -31,31 +28,7 @@ impl QwdClient {
         // message } }` and no command fields. Treat it as an error rather than
         // letting serde report "missing field id" every second.
         if value.get("cmd").is_none() {
-            let code = value.get("code").and_then(Value::as_i64);
-            let message = value
-                .pointer("/data/message")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let disabled = self.caps.observe_rejection(message);
-            if !disabled.is_empty() {
-                tracing::warn!(
-                    features = ?disabled,
-                    code = ?code,
-                    "[QWD] manager is an older build; disabling unsupported events"
-                );
-            }
-            let signature = format!("{code:?}:{message}");
-            if self.last_manager_error.as_deref() != Some(signature.as_str()) {
-                tracing::warn!(
-                    code = ?code,
-                    message,
-                    raw = %text,
-                    "[QWD] manager rejected a message"
-                );
-                self.last_manager_error = Some(signature);
-            } else {
-                tracing::debug!(code = ?code, message, "[QWD] manager error (repeated)");
-            }
+            self.handle_manager_rejection(text);
             return Ok(());
         }
 
@@ -90,7 +63,8 @@ impl QwdClient {
 
         let result = match command.cmd.as_str() {
             "room.reserve" => self.handle_room_reserve(&command),
-            "move.prepare" => self.handle_move_prepare(&command),
+            "room.sync" => self.handle_room_sync(&command),
+            "move.prepare" | "move.renew" => self.handle_move_prepare(&command),
             "move.cancel" => self.handle_move_cancel(&command),
             "move.commit" | "player.redirect" => self.handle_move_commit(socket, &command),
             "room.destroy" => self.handle_room_destroy(socket, &command),
@@ -107,6 +81,18 @@ impl QwdClient {
             Err(message) => (INTERNAL, Some(message), None),
         };
 
+        // Room-scoped success acks carry capacity facts so the manager can
+        // correct its cached snapshot from the node's own numbers.
+        let data = if code == OK
+            && matches!(
+                command.cmd.as_str(),
+                "room.reserve" | "room.sync" | "move.prepare" | "move.renew" | "move.cancel"
+            ) {
+            self.facts_data(data)
+        } else {
+            data
+        };
+
         let value = ack(command.id, code, message.as_deref(), data);
         tracing::debug!(
             id = command.id,
@@ -115,6 +101,47 @@ impl QwdClient {
             "[QWD] command ack"
         );
         self.send_json(socket, &value)
+    }
+
+    /// Log a manager-side error reply and learn the manager's capabilities
+    /// from its validation output.
+    fn handle_manager_rejection(&mut self, text: &str) {
+        let value: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+        let code = value.get("code").and_then(Value::as_i64);
+        let message = value
+            .pointer("/data/message")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let disabled = self.caps.observe_rejection(message);
+        if !disabled.is_empty() {
+            tracing::warn!(
+                features = ?disabled,
+                code = ?code,
+                "[QWD] manager is an older build; disabling unsupported events"
+            );
+        }
+        let signature = format!("{code:?}:{message}");
+        if self.last_manager_error.as_deref() != Some(signature.as_str()) {
+            tracing::warn!(
+                code = ?code,
+                message,
+                raw = %text,
+                "[QWD] manager rejected a message"
+            );
+            self.last_manager_error = Some(signature);
+        } else {
+            tracing::debug!(code = ?code, message, "[QWD] manager error (repeated)");
+        }
+    }
+
+    /// Ack payload for the room-scoped commands, enriched with capacity facts.
+    fn facts_data(&mut self, data: Option<Value>) -> Option<Value> {
+        let status = self.status().ok()?;
+        let now = Instant::now();
+        let facts = self
+            .reservations
+            .facts(&status, self.config.capacity, self.telemetry_seq, now);
+        with_facts(data, facts)
     }
 
     fn handle_room_id_conflict(&mut self, socket: &mut Socket) -> Result<(), String> {
@@ -153,27 +180,50 @@ impl QwdClient {
         let Some(player_id) = command.string_field("playerId") else {
             return Ok((BAD_REQUEST, Some("playerId is required".to_string()), None));
         };
+        let presented_token = command.string_field("reservationToken");
 
         let status = self.status()?;
+        let now = Instant::now();
+
+        // An allocation for a player that is already here is a no-op; renewing
+        // an existing hold must come from its owner.
+        if let Some(existing) = self.reservations.player_token_of(player_id, now) {
+            if !matches_token(Some(existing), presented_token) {
+                return Ok((
+                    CONFLICT,
+                    Some("reservation owner conflicts".to_string()),
+                    None,
+                ));
+            }
+            let token = self
+                .reservations
+                .reserve_player(player_id, command.ttl(), now);
+            return Ok((
+                OK,
+                None,
+                Some(json!({
+                    "accepted": true,
+                    "reservationId": player_id,
+                    "reservationToken": token,
+                    "idempotent": true,
+                    "slots": 1
+                })),
+            ));
+        }
         if status
             .player_list
             .iter()
             .any(|player| player.uuid == player_id)
         {
             return Ok((
-                OK,
+                CONFLICT,
+                Some("player already physically present".to_string()),
                 None,
-                Some(json!({
-                    "accepted": true,
-                    "reservationId": format!("existing-{player_id}"),
-                    "slots": 0
-                })),
             ));
         }
-
-        let now = Instant::now();
-        let reserved = self.reservations.count(now);
-        if status.player_list.len() + reserved + 1 > self.config.capacity {
+        if status.player_list.len() + self.reservations.outstanding_slots(now) + 1
+            > self.config.capacity
+        {
             return Ok((
                 NO_CAPACITY,
                 Some("room capacity reserved".to_string()),
@@ -181,26 +231,36 @@ impl QwdClient {
             ));
         }
 
-        let reservation_id = self
+        let token = self
             .reservations
             .reserve_player(player_id, command.ttl(), now);
+        let expires_at = now_ms() + command.ttl().as_millis() as u64;
 
-        tracing::debug!(
-            room_id = %room_id,
-            player_id = %player_id,
-            reservation_id = %reservation_id,
-            "[QWD] room.reserve"
-        );
+        tracing::debug!(room_id = %room_id, player_id = %player_id, "[QWD] room.reserve");
 
         Ok((
             OK,
             None,
             Some(json!({
                 "accepted": true,
-                "reservationId": reservation_id,
+                "reservationId": player_id,
+                "reservationToken": token,
+                "expiresAt": expires_at,
                 "slots": 1
             })),
         ))
+    }
+
+    /// `room.sync`: the manager's snapshot drifted and wants a full frame.
+    fn handle_room_sync(&mut self, command: &ManagerCommand) -> Result<AckParts, String> {
+        if let Some(room_id) = command.room_id()
+            && room_id != self.room_id
+        {
+            return Ok((NOT_FOUND, Some("room not found".to_string()), None));
+        }
+        self.force_full = true;
+        tracing::debug!("[QWD] room.sync; forcing full telemetry");
+        Ok((OK, None, None))
     }
 
     fn handle_move_prepare(&mut self, command: &ManagerCommand) -> Result<AckParts, String> {
@@ -225,39 +285,38 @@ impl QwdClient {
                 None,
             ));
         }
+        let presented_token = command.string_field("reservationToken");
 
         let status = self.status()?;
+        let now = Instant::now();
+
+        if let Some(expected) = command.u64_field("expectedVersion")
+            && expected > self.last_telemetry_seq_sent
+        {
+            // The manager's snapshot is ahead of our last published seq (for
+            // example right after our reconnect). It re-syncs with `room.sync`
+            // and its own participant guards, so accept the move.
+            tracing::debug!(
+                move_id = %move_id,
+                expected_version = expected,
+                current_version = self.last_telemetry_seq_sent,
+                "[QWD] move.prepare ahead of our telemetry; accepting"
+            );
+        }
+
         if player_ids.iter().any(|player_id| {
             status
                 .player_list
                 .iter()
                 .any(|player| &player.uuid == player_id)
         }) {
-            return Ok((CONFLICT, Some("player already in room".to_string()), None));
+            return Ok((
+                CONFLICT,
+                Some("participant already present".to_string()),
+                None,
+            ));
         }
 
-        if let Some(expected) = command.u64_field("expectedVersion") {
-            // The manager's room version is the last telemetry seq it accepted.
-            // It can lag behind ours while its event loop is busy or while an
-            // older manager build drops frames. Rejecting with STALE_PLAN then
-            // deadlocks every move, so accept and re-validate the live room
-            // state below; the manager will catch up on its own.
-            let current = self.last_telemetry_seq_sent;
-            if expected < current {
-                // Normal against managers that do not derive their room version
-                // from our telemetry seq. The live state is validated below, so
-                // keep this out of the default log level.
-                tracing::debug!(
-                    move_id = %move_id,
-                    expected_version = expected,
-                    current_version = current,
-                    lag_frames = current - expected,
-                    "[QWD] move.prepare with stale manager version; validating live state"
-                );
-            }
-        }
-
-        let now = Instant::now();
         let reserved = self.reservations.reserved_players(now);
         let new_players = player_ids
             .iter()
@@ -271,17 +330,30 @@ impl QwdClient {
             ));
         }
 
-        if self
-            .reservations
-            .reserve_move(move_id, &player_ids, command.ttl(), now)
-            .is_err()
-        {
-            return Ok((
-                CONFLICT,
-                Some("move reservation conflicts".to_string()),
-                None,
-            ));
-        }
+        let token = match self.reservations.reserve_move(
+            move_id,
+            &player_ids,
+            command.ttl(),
+            now,
+            presented_token,
+        ) {
+            Ok(token) => token,
+            Err(ReserveMoveError::ForeignToken) => {
+                return Ok((
+                    CONFLICT,
+                    Some("reservation owner conflicts".to_string()),
+                    None,
+                ));
+            }
+            Err(ReserveMoveError::Conflict) => {
+                return Ok((
+                    CONFLICT,
+                    Some("move reservation conflicts".to_string()),
+                    None,
+                ));
+            }
+        };
+        let expires_at = now_ms() + command.ttl().as_millis() as u64;
 
         tracing::debug!(
             move_id = %move_id,
@@ -296,6 +368,8 @@ impl QwdClient {
             Some(json!({
                 "accepted": true,
                 "moveId": move_id,
+                "reservationToken": token,
+                "expiresAt": expires_at,
                 "slots": player_ids.len()
             })),
         ))
@@ -305,197 +379,24 @@ impl QwdClient {
         let Some(move_id) = command.move_id() else {
             return Ok((BAD_REQUEST, Some("moveId is required".to_string()), None));
         };
-        self.reservations.release_move(move_id);
-        tracing::debug!(move_id = %move_id, "[QWD] move.cancel");
-        Ok((OK, None, Some(json!({ "accepted": true }))))
-    }
-
-    fn handle_move_commit(
-        &mut self,
-        socket: &mut Socket,
-        command: &ManagerCommand,
-    ) -> Result<AckParts, String> {
-        let move_id = command
-            .move_id()
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("redirect-{}-{}", now_ms(), command.id));
-
-        let player_ids = command.player_ids();
-        if player_ids.is_empty() || player_ids.len() > 7 {
+        let presented = command.string_field("reservationToken");
+        if !matches_token(self.reservations.token_of(move_id), presented) {
             return Ok((
-                BAD_REQUEST,
-                Some("playerIds must contain 1..=7 entries".to_string()),
+                CONFLICT,
+                Some("reservation owner conflicts".to_string()),
                 None,
             ));
         }
-
-        if let Some(from_room_id) = command.string_field("fromRoomId")
-            && from_room_id != self.room_id
-        {
-            return Ok((NOT_FOUND, Some("source room not found".to_string()), None));
+        self.reservations.release_move(move_id);
+        tracing::debug!(move_id = %move_id, "[QWD] move.cancel");
+        let mut data = json!({
+            "accepted": true,
+            "moveId": move_id,
+        });
+        if let Some(token) = presented {
+            data["reservationToken"] = Value::String(token.to_string());
         }
-
-        let Some(to_room_id) = command
-            .string_field("toRoomUuid")
-            .or_else(|| command.room_id())
-        else {
-            return Ok((BAD_REQUEST, Some("toRoomId is required".to_string()), None));
-        };
-
-        // The client needs the destination room UUID in MoveGame to complete
-        // the transfer; a zero UUID makes it drop the connection instead of
-        // joining the target node.
-        //
-        // The manager may send `toRoomUuid` explicitly (newer builds do) or
-        // only the room id. Nodes now use 8-digit decimal room ids, which are
-        // not `TgcUuid` text, so derive the same deterministic uuid every node
-        // uses for that id instead of rejecting the move.
-        let destination = command
-            .string_field("toRoomUuid")
-            .and_then(TgcUuid::parse)
-            .or_else(|| destination_uuid(to_room_id));
-        let Some(destination) = destination else {
-            return Ok((
-                BAD_REQUEST,
-                Some("invalid destination room uuid".to_string()),
-                Some(json!({ "toRoomId": to_room_id })),
-            ));
-        };
-
-        tracing::debug!(
-            move_id = %move_id,
-            players = ?player_ids,
-            to_room_id = %to_room_id,
-            "[QWD] move.commit"
-        );
-        let Some(udp_host) = command.string_field("udpHost") else {
-            return Ok((BAD_REQUEST, Some("udpHost is required".to_string()), None));
-        };
-        let Some(udp_port) = command.u64_field("udpPort") else {
-            return Ok((BAD_REQUEST, Some("udpPort is required".to_string()), None));
-        };
-        if udp_port == 0 || udp_port > u16::MAX as u64 {
-            return Ok((BAD_REQUEST, Some("invalid udpPort".to_string()), None));
-        }
-        let host: IpAddr = match udp_host.parse() {
-            Ok(host) => host,
-            Err(_) => {
-                return Ok((BAD_REQUEST, Some("invalid udpHost".to_string()), None));
-            }
-        };
-
-        let status = self.status()?;
-        let mut net_to_uuid = HashMap::new();
-        let mut uuid_to_net = HashMap::new();
-        for player in &status.player_list {
-            net_to_uuid.insert(player.player_id, player.uuid.clone());
-            uuid_to_net.insert(player.uuid.clone(), player.player_id);
-        }
-
-        let mut net_ids = Vec::new();
-        let mut missing = Vec::new();
-        for player_id in &player_ids {
-            match uuid_to_net.get(player_id) {
-                Some(net_id) => net_ids.push(*net_id),
-                None => missing.push(player_id.clone()),
-            }
-        }
-
-        if !missing.is_empty() {
-            self.send_move_result(
-                socket,
-                &move_id,
-                false,
-                &[],
-                &missing,
-                Some("player_not_found"),
-            )?;
-            return Ok((
-                NOT_FOUND,
-                Some("one or more players are not in this room".to_string()),
-                Some(json!({ "failedPlayerIds": missing })),
-            ));
-        }
-
-        let room = RoomEndpoint {
-            id: to_room_id.to_string(),
-            address: NetAddress::new(host, udp_port as u16),
-            uuid: Some(destination),
-            capacity: 8,
-            players: 0,
-        };
-
-        if let Err(error) = self.control.upsert_room(room) {
-            let message = control_error(error);
-            self.send_move_result(socket, &move_id, false, &[], &player_ids, Some(&message))?;
-            return Ok((INTERNAL, Some(message), None));
-        }
-
-        match self.control.move_players(net_ids, to_room_id) {
-            Ok(ControlResponse::Move(outcome)) => {
-                if outcome.moved.is_empty() {
-                    self.send_move_result(
-                        socket,
-                        &move_id,
-                        false,
-                        &[],
-                        &player_ids,
-                        Some("move_not_started"),
-                    )?;
-                    return Ok((
-                        CONFLICT,
-                        Some("move was not started".to_string()),
-                        Some(json!({ "accepted": false, "failedPlayerIds": player_ids })),
-                    ));
-                }
-
-                let mut pending = HashSet::new();
-                for internal_id in &outcome.move_ids {
-                    self.internal_to_qwd.insert(*internal_id, move_id.clone());
-                    pending.insert(*internal_id);
-                }
-                self.qwd_moves.insert(
-                    move_id.clone(),
-                    PendingQwdMove {
-                        pending,
-                        moved: Vec::new(),
-                        failed: Vec::new(),
-                        reason: None,
-                    },
-                );
-
-                let moved: Vec<String> = outcome
-                    .moved
-                    .iter()
-                    .filter_map(|net_id| net_to_uuid.get(net_id).cloned())
-                    .collect();
-                let failed: Vec<String> = outcome
-                    .failed
-                    .iter()
-                    .filter_map(|net_id| net_to_uuid.get(net_id).cloned())
-                    .collect();
-
-                Ok((
-                    OK,
-                    None,
-                    Some(json!({
-                        "accepted": true,
-                        "movedPlayerIds": moved,
-                        "failedPlayerIds": failed
-                    })),
-                ))
-            }
-            Ok(ControlResponse::Error { message }) => {
-                self.send_move_result(socket, &move_id, false, &[], &player_ids, Some(&message))?;
-                Ok((CONFLICT, Some(message), Some(json!({ "accepted": false }))))
-            }
-            Ok(_) => Ok((INTERNAL, Some("unexpected move response".to_string()), None)),
-            Err(error) => {
-                let message = control_error(error);
-                self.send_move_result(socket, &move_id, false, &[], &player_ids, Some(&message))?;
-                Ok((NODE_UNAVAILABLE, Some(message), None))
-            }
-        }
+        Ok((OK, None, Some(data)))
     }
 
     fn handle_room_destroy(

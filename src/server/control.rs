@@ -84,6 +84,8 @@ impl ServerState {
                         player_id: peer.player_id,
                         uuid: format!("{:?}", peer.uuid),
                         level_id: peer.level_id,
+                        lv_seq: peer.lv_seq,
+                        moving: peer.state == PeerState::Moving,
                         position: peer.player_delta.position,
                         velocity: peer.player_delta.velocity,
                         state_at: peer.player_delta.state_at_ms,

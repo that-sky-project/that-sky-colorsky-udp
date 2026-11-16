@@ -19,6 +19,14 @@ pub(crate) struct ManagerCaps {
     pub reservation_expired: bool,
     /// Manager accepts `kind`/`baseSeq`/`removedPlayers` telemetry frames.
     pub delta_telemetry: bool,
+    /// Manager accepts the occupancy facts object (`physicalPlayers`,
+    /// `activePlayers`, `reservedSlots`).
+    pub occupancy_facts: bool,
+    /// Manager accepts `lvSeq`/`status` inside telemetry player entries.
+    pub player_status_fields: bool,
+    /// Manager accepts the newer settle-event extras (`phase`,
+    /// `reservationToken`, `admittedPlayerIds`, `expiresAt`).
+    pub settle_extras: bool,
 }
 
 impl Default for ManagerCaps {
@@ -28,6 +36,9 @@ impl Default for ManagerCaps {
             move_completed: true,
             reservation_expired: true,
             delta_telemetry: true,
+            occupancy_facts: true,
+            player_status_fields: true,
+            settle_extras: true,
         }
     }
 }
@@ -64,18 +75,52 @@ impl ManagerCaps {
                     _ => {}
                 },
                 Some("unrecognized_keys") => {
-                    let delta_keys =
-                        issue
-                            .get("keys")
-                            .and_then(Value::as_array)
-                            .is_some_and(|keys| {
-                                keys.iter()
-                                    .filter_map(Value::as_str)
-                                    .any(|key| matches!(key, "kind" | "baseSeq" | "removedPlayers"))
-                            });
-                    if delta_keys && self.delta_telemetry {
+                    let keys: Vec<&str> = issue
+                        .get("keys")
+                        .and_then(Value::as_array)
+                        .map(|values| values.iter().filter_map(Value::as_str).collect())
+                        .unwrap_or_default();
+                    if self.delta_telemetry
+                        && keys
+                            .iter()
+                            .any(|key| matches!(*key, "kind" | "baseSeq" | "removedPlayers"))
+                    {
                         self.delta_telemetry = false;
                         disabled.push("delta telemetry");
+                    }
+                    if self.occupancy_facts
+                        && keys.iter().any(|key| {
+                            matches!(*key, "physicalPlayers" | "activePlayers" | "reservedSlots")
+                        })
+                    {
+                        self.occupancy_facts = false;
+                        disabled.push("occupancy facts");
+                    }
+                    if self.settle_extras
+                        && keys.iter().any(|key| {
+                            matches!(
+                                *key,
+                                "phase" | "reservationToken" | "admittedPlayerIds" | "expiresAt"
+                            )
+                        })
+                    {
+                        self.settle_extras = false;
+                        disabled.push("settle event extras");
+                    }
+                    let in_players =
+                        issue
+                            .get("path")
+                            .and_then(Value::as_array)
+                            .is_some_and(|path| {
+                                path.iter()
+                                    .any(|segment| segment.as_str() == Some("players"))
+                            });
+                    if self.player_status_fields
+                        && in_players
+                        && keys.iter().any(|key| matches!(*key, "lvSeq" | "status"))
+                    {
+                        self.player_status_fields = false;
+                        disabled.push("player status fields");
                     }
                 }
                 _ => {}
@@ -137,6 +182,67 @@ mod tests {
         );
         assert!(!caps.move_completed);
         assert!(caps.delta_telemetry);
+    }
+
+    /// Captured from a `0ae6f7b`-era manager that knows `version` but not the
+    /// occupancy facts object.
+    const FACTS_REJECTION: &str = r#"[
+      {
+        "code": "unrecognized_keys",
+        "keys": ["activePlayers", "physicalPlayers", "reservedSlots"],
+        "path": ["data"],
+        "message": "Unrecognized key(s) in object"
+      }
+    ]"#;
+
+    #[test]
+    fn facts_rejection_disables_occupancy_facts() {
+        let mut caps = ManagerCaps::default();
+        assert_eq!(
+            caps.observe_rejection(FACTS_REJECTION),
+            vec!["occupancy facts"]
+        );
+        assert!(!caps.occupancy_facts);
+        assert!(caps.delta_telemetry);
+        assert!(caps.settle_extras);
+    }
+
+    #[test]
+    fn player_field_rejection_disables_status_fields() {
+        let mut caps = ManagerCaps::default();
+        let rejection = r#"[
+          {
+            "code": "unrecognized_keys",
+            "keys": ["lvSeq", "status"],
+            "path": ["data", "players", 0],
+            "message": "Unrecognized key(s) in object"
+          }
+        ]"#;
+        assert_eq!(
+            caps.observe_rejection(rejection),
+            vec!["player status fields"]
+        );
+        assert!(!caps.player_status_fields);
+        assert!(caps.occupancy_facts);
+    }
+
+    #[test]
+    fn settle_field_rejection_disables_extras() {
+        let mut caps = ManagerCaps::default();
+        let rejection = r#"[
+          {
+            "code": "unrecognized_keys",
+            "keys": ["reservationToken", "phase"],
+            "path": ["data"],
+            "message": "Unrecognized key(s) in object"
+          }
+        ]"#;
+        assert_eq!(
+            caps.observe_rejection(rejection),
+            vec!["settle event extras"]
+        );
+        assert!(!caps.settle_extras);
+        assert!(caps.move_completed);
     }
 
     #[test]

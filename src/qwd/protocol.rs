@@ -5,12 +5,16 @@ use serde_json::{Value, json};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const DEFAULT_TTL_MS: u64 = 10_000;
+/// XYSKY nodes accept leases up to two minutes; the manager renews a hold it
+/// still needs instead of letting it lapse, so never expire earlier than that.
+pub const MAX_TTL_MS: u64 = 120_000;
 
 pub const OK: i64 = 0;
 pub const BAD_REQUEST: i64 = 4000;
 pub const NOT_FOUND: i64 = 4004;
 pub const CONFLICT: i64 = 4009;
 pub const NO_CAPACITY: i64 = 4029;
+pub const STALE_PLAN: i64 = 4090;
 pub const NODE_UNAVAILABLE: i64 = 5001;
 pub const INTERNAL: i64 = 5999;
 
@@ -68,7 +72,7 @@ impl ManagerCommand {
 
     pub fn ttl(&self) -> std::time::Duration {
         let ttl = self.u64_field("ttlMs").unwrap_or(DEFAULT_TTL_MS);
-        std::time::Duration::from_millis(ttl.clamp(1_000, 60_000))
+        std::time::Duration::from_millis(ttl.clamp(1_000, MAX_TTL_MS))
     }
 }
 

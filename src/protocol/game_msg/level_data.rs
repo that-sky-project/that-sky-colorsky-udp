@@ -66,7 +66,7 @@ impl LevelData {
         Some(Self { header, data })
     }
 
-    /// Convert LevelData to Vec<u8>
+    /// Convert LevelData to `Vec<u8>`
     pub fn to_bytes(&self) -> Vec<u8> {
         let header_bytes = unsafe {
             std::slice::from_raw_parts(
