@@ -183,10 +183,13 @@ impl QwdClient {
         let presented_token = command.string_field("reservationToken");
 
         let status = self.status()?;
-        let now = Instant::now();
 
-        // An allocation for a player that is already here is a no-op; renewing
-        // an existing hold must come from its owner.
+        // An allocation for a player that already has a hold is a renewal: the
+        // manager retries the allocation or reuses its shadow hold, and its
+        // `acknowledge()` requires the lease in every positive ack. Renewing an
+        // existing hold must come from its owner.
+        let now = Instant::now();
+        let expires_at = now_ms() + command.ttl().as_millis() as u64;
         if let Some(existing) = self.reservations.player_token_of(player_id, now) {
             if !matches_token(Some(existing), presented_token) {
                 return Ok((
@@ -205,6 +208,7 @@ impl QwdClient {
                     "accepted": true,
                     "reservationId": player_id,
                     "reservationToken": token,
+                    "expiresAt": expires_at,
                     "idempotent": true,
                     "slots": 1
                 })),
@@ -234,7 +238,6 @@ impl QwdClient {
         let token = self
             .reservations
             .reserve_player(player_id, command.ttl(), now);
-        let expires_at = now_ms() + command.ttl().as_millis() as u64;
 
         tracing::debug!(room_id = %room_id, player_id = %player_id, "[QWD] room.reserve");
 
