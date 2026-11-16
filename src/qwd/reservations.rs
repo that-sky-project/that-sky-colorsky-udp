@@ -109,6 +109,11 @@ impl Reservations {
     /// Occupancy facts derived from the live status and this hold set.
     /// `version` is the node's telemetry sequence; the manager ignores facts
     /// older than its cached snapshot, so the seq must keep increasing.
+    ///
+    /// `reserved_slots` is clamped to the manager's invariant
+    /// `physical + reserved <= capacity`: when the room is physically full, a
+    /// hold whose player has not shown up yet must not make the facts invalid,
+    /// or the manager rejects every telemetry frame and spams `room.sync`.
     pub fn facts(
         &self,
         status: &ServerStatus,
@@ -116,10 +121,14 @@ impl Reservations {
         version: u64,
         now: Instant,
     ) -> CapacityFacts {
+        let physical_players = status.player_list.len();
+        let reserved = self
+            .outstanding_slots(now)
+            .min(capacity.saturating_sub(physical_players));
         CapacityFacts {
-            physical_players: status.player_list.len(),
-            active_players: status.player_list.len(),
-            reserved_slots: self.outstanding_slots(now),
+            physical_players,
+            active_players: physical_players,
+            reserved_slots: reserved,
             capacity,
             version,
         }
@@ -288,6 +297,7 @@ pub enum ReserveMoveError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::PlayerInfo;
     use std::time::Duration;
 
     fn ids<const N: usize>(values: [&str; N]) -> Vec<String> {
@@ -418,5 +428,52 @@ mod tests {
         assert_eq!(expired[0].player_ids, ids(["player-1", "player-2"]));
         assert_eq!(expired[0].admitted_player_ids, ids(["player-1"]));
         assert!(!expired[0].token.is_empty());
+    }
+
+    /// A full room holding a slot for a player who never joined used to report
+    /// `physical + reserved > capacity`. The manager treats that as an invalid
+    /// frame: every telemetry update was rejected and it spammed `room.sync`
+    /// until the hold expired. The facts must satisfy the invariant instead.
+    #[test]
+    fn facts_clamp_reserved_slots_to_the_room_invariant() {
+        let mut reservations = Reservations::default();
+        let now = Instant::now();
+        reservations.reserve_player("incoming", Duration::from_secs(30), now);
+
+        let status = ServerStatus {
+            addr: String::new(),
+            peers: 8,
+            players: 8,
+            pending_moves: 0,
+            draining: false,
+            rooms: Vec::new(),
+            player_list: (1..=8)
+                .map(|index| PlayerInfo {
+                    player_id: index,
+                    uuid: format!("player-{index}"),
+                    level_id: 1,
+                    lv_seq: 0,
+                    moving: false,
+                    position: None,
+                    velocity: None,
+                    state_at: 0,
+                    last_move_at: 0,
+                    affinity: Vec::new(),
+                })
+                .collect(),
+        };
+
+        let facts = reservations.facts(&status, 8, 42, now);
+        assert_eq!(facts.physical_players, 8);
+        assert_eq!(facts.reserved_slots, 0);
+
+        // With one free slot the hold is reported normally.
+        let status = ServerStatus {
+            player_list: status.player_list[..7].to_vec(),
+            ..status
+        };
+        let facts = reservations.facts(&status, 8, 43, now);
+        assert_eq!(facts.physical_players, 7);
+        assert_eq!(facts.reserved_slots, 1);
     }
 }

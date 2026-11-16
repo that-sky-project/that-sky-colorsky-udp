@@ -4,13 +4,13 @@ use std::time::Instant;
 
 use serde_json::{Value, json};
 
-use crate::control::ControlCommand;
+use crate::control::{ControlCommand, ServerStatus};
 
 use super::facts::with_facts;
 use super::protocol::{
     BAD_REQUEST, CONFLICT, INTERNAL, ManagerCommand, NO_CAPACITY, NOT_FOUND, OK, ack, event,
 };
-use super::reservations::{ReserveMoveError, matches_token};
+use super::reservations::{CapacityFacts, ReserveMoveError, matches_token};
 use super::util::{control_error, generate_room_id, now_ms};
 use super::{AckParts, QwdClient, Socket};
 
@@ -81,18 +81,6 @@ impl QwdClient {
             Err(message) => (INTERNAL, Some(message), None),
         };
 
-        // Room-scoped success acks carry capacity facts so the manager can
-        // correct its cached snapshot from the node's own numbers.
-        let data = if code == OK
-            && matches!(
-                command.cmd.as_str(),
-                "room.reserve" | "room.sync" | "move.prepare" | "move.renew" | "move.cancel"
-            ) {
-            self.facts_data(data)
-        } else {
-            data
-        };
-
         let value = ack(command.id, code, message.as_deref(), data);
         tracing::debug!(
             id = command.id,
@@ -134,14 +122,15 @@ impl QwdClient {
         }
     }
 
-    /// Ack payload for the room-scoped commands, enriched with capacity facts.
-    fn facts_data(&mut self, data: Option<Value>) -> Option<Value> {
-        let status = self.status().ok()?;
-        let now = Instant::now();
-        let facts = self
-            .reservations
-            .facts(&status, self.config.capacity, self.telemetry_seq, now);
-        with_facts(data, facts)
+    /// Capacity facts for an ack. Only `room.reserve` and `move.prepare` acks
+    /// are read by the manager, so no other command pays a status round trip.
+    fn facts_for(&self, status: &ServerStatus) -> CapacityFacts {
+        self.reservations.facts(
+            status,
+            self.config.capacity,
+            self.telemetry_seq,
+            Instant::now(),
+        )
     }
 
     fn handle_room_id_conflict(&mut self, socket: &mut Socket) -> Result<(), String> {
@@ -201,17 +190,21 @@ impl QwdClient {
             let token = self
                 .reservations
                 .reserve_player(player_id, command.ttl(), now);
+            let facts = self.facts_for(&status);
             return Ok((
                 OK,
                 None,
-                Some(json!({
-                    "accepted": true,
-                    "reservationId": player_id,
-                    "reservationToken": token,
-                    "expiresAt": expires_at,
-                    "idempotent": true,
-                    "slots": 1
-                })),
+                with_facts(
+                    Some(json!({
+                        "accepted": true,
+                        "reservationId": player_id,
+                        "reservationToken": token,
+                        "expiresAt": expires_at,
+                        "idempotent": true,
+                        "slots": 1
+                    })),
+                    facts,
+                ),
             ));
         }
         if status
@@ -244,13 +237,16 @@ impl QwdClient {
         Ok((
             OK,
             None,
-            Some(json!({
-                "accepted": true,
-                "reservationId": player_id,
-                "reservationToken": token,
-                "expiresAt": expires_at,
-                "slots": 1
-            })),
+            with_facts(
+                Some(json!({
+                    "accepted": true,
+                    "reservationId": player_id,
+                    "reservationToken": token,
+                    "expiresAt": expires_at,
+                    "slots": 1
+                })),
+                self.facts_for(&status),
+            ),
         ))
     }
 
@@ -368,13 +364,16 @@ impl QwdClient {
         Ok((
             OK,
             None,
-            Some(json!({
-                "accepted": true,
-                "moveId": move_id,
-                "reservationToken": token,
-                "expiresAt": expires_at,
-                "slots": player_ids.len()
-            })),
+            with_facts(
+                Some(json!({
+                    "accepted": true,
+                    "moveId": move_id,
+                    "reservationToken": token,
+                    "expiresAt": expires_at,
+                    "slots": player_ids.len()
+                })),
+                self.facts_for(&status),
+            ),
         ))
     }
 
