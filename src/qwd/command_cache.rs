@@ -116,7 +116,10 @@ mod tests {
         let fp = fingerprint(&value);
         assert_eq!(cache.get(1, &fp), Lookup::Miss);
         cache.finish(1, fp.clone(), json!({"id": 1, "code": 0}));
-        assert_eq!(cache.get(1, &fp), Lookup::Replay(json!({"id": 1, "code": 0})));
+        assert_eq!(
+            cache.get(1, &fp),
+            Lookup::Replay(json!({"id": 1, "code": 0}))
+        );
         assert_eq!(cache.get(1, "different"), Lookup::Collision);
     }
 

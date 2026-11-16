@@ -175,6 +175,9 @@ mod tests {
     fn ttl_is_clamped() {
         let command: ManagerCommand =
             serde_json::from_str(r#"{"id":1,"cmd":"room.reserve","data":{"ttlMs":1}}"#).unwrap();
-        assert_eq!(command.ttl().unwrap_err(), "ttlMs must be between 1000 and 120000");
+        assert_eq!(
+            command.ttl().unwrap_err(),
+            "ttlMs must be between 1000 and 120000"
+        );
     }
 }
