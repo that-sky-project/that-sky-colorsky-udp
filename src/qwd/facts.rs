@@ -84,6 +84,13 @@ pub fn expected_participants(value: &Value) -> Vec<ExpectedParticipant> {
 /// Whether a player still matches the manager's expectation. `sessionId` is
 /// only enforced when both sides know it (colorsky does not report one).
 pub fn participant_matches(expected: &ExpectedParticipant, player: &PlayerInfo) -> bool {
+    if let (Some(expected_session), Some(actual)) = (
+        expected.session_id.as_deref(),
+        player.session_id.map(|session| session.to_string()),
+    ) && expected_session != actual
+    {
+        return false;
+    }
     if let Some(level_id) = expected.level_id
         && level_id != player.level_id
     {
@@ -163,6 +170,37 @@ mod tests {
         assert_eq!(guard[0].lv_seq, Some(3));
         assert_eq!(guard[0].session_id.as_deref(), Some("s1"));
         assert_eq!(guard[1].level_id, None);
+    }
+
+    #[test]
+    fn participant_guard_rejects_session_change() {
+        let mut expected = ExpectedParticipant {
+            player_id: "p1".to_string(),
+            session_id: Some("1000".to_string()),
+            level_id: Some(7),
+            lv_seq: Some(3),
+        };
+        let mut player = crate::control::PlayerInfo {
+            player_id: 1,
+            uuid: "p1".to_string(),
+            level_id: 7,
+            lv_seq: 3,
+            moving: false,
+            session_id: Some(1000),
+            position: None,
+            velocity: None,
+            state_at: 0,
+            last_move_at: 0,
+            affinity: Vec::new(),
+        };
+        assert!(participant_matches(&expected, &player));
+        // The client reconnected (new connection token): the plan is stale.
+        player.session_id = Some(2000);
+        assert!(!participant_matches(&expected, &player));
+        // Without a session on either side the check is skipped.
+        expected.session_id = None;
+        player.session_id = None;
+        assert!(participant_matches(&expected, &player));
     }
 
     #[test]

@@ -86,6 +86,7 @@ impl ServerState {
                         level_id: peer.level_id,
                         lv_seq: peer.lv_seq,
                         moving: peer.state == PeerState::Moving,
+                        session_id: peer.conn_magic,
                         position: peer.player_delta.position,
                         velocity: peer.player_delta.velocity,
                         state_at: peer.player_delta.state_at_ms,

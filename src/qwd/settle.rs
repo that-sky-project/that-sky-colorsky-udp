@@ -151,17 +151,26 @@ impl QwdClient {
         server_event: ServerEvent,
     ) -> Result<(), String> {
         match server_event {
-            ServerEvent::PlayerJoined { uuid, level_id, .. } => {
+            ServerEvent::PlayerJoined {
+                uuid,
+                level_id,
+                session_id,
+                ..
+            } => {
                 let player_id = format!("{uuid:?}");
                 let completed = self.reservations.confirm_player(&player_id);
+                let mut player = json!({
+                    "playerId": player_id,
+                    "level": level_id
+                });
+                if let Some(session) = session_id {
+                    player["sessionId"] = json!(session.to_string());
+                }
                 let value = event(
                     "player.join",
                     json!({
                         "roomId": self.room_id,
-                        "player": {
-                            "playerId": player_id,
-                            "level": level_id
-                        }
+                        "player": player
                     }),
                 );
                 self.send_json(socket, &value)?;

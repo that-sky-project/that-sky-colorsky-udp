@@ -124,6 +124,10 @@ pub struct PlayerInfo {
     pub lv_seq: u8,
     /// Whether the client is mid-migration (MoveGame sent, result pending).
     pub moving: bool,
+    /// Per-connection token reported to QWD as `sessionId`. Without it the
+    /// manager cannot tell a reconnected client from the old session, and its
+    /// lvSeq wrap check rejects every telemetry frame of a moved-in player.
+    pub session_id: Option<u32>,
     /// Last position decoded from the client's PlayerState header.
     pub position: Option<[f32; 3]>,
     /// Approximate speed in units per second from consecutive positions.
@@ -198,6 +202,8 @@ pub enum ServerEvent {
         player_id: u8,
         uuid: TgcUuid,
         level_id: u32,
+        /// Per-connection token, reported to QWD as `sessionId`.
+        session_id: Option<u32>,
     },
     PlayerLeft {
         player_id: u8,

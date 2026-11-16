@@ -454,6 +454,7 @@ mod tests {
                     level_id: 1,
                     lv_seq: 0,
                     moving: false,
+                    session_id: None,
                     position: None,
                     velocity: None,
                     state_at: 0,

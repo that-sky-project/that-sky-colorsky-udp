@@ -248,6 +248,9 @@ fn player_telemetry(player: &PlayerInfo, status_fields: bool) -> Value {
         "playerId": player.uuid,
         "levelId": player.level_id,
     });
+    if let Some(session) = player.session_id {
+        value["sessionId"] = json!(session.to_string());
+    }
     if status_fields {
         value["lvSeq"] = json!(player.lv_seq);
         value["status"] = json!(player_status(player.moving));
@@ -294,6 +297,7 @@ mod tests {
             level_id,
             lv_seq: 0,
             moving: false,
+            session_id: None,
             position: Some([1.0, 2.0, 3.0]),
             velocity: Some(4.0),
             state_at: 100,

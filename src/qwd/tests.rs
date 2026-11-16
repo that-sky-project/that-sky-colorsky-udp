@@ -187,6 +187,7 @@ fn falls_back_to_move_result_on_old_managers() {
                 player_id: 1,
                 uuid: player_uuid,
                 level_id: 42,
+                session_id: Some(7),
             })
             .unwrap();
 
@@ -212,6 +213,7 @@ fn registers_and_answers_qwd_commands() {
         level_id: 0,
         lv_seq: 0,
         moving: false,
+        session_id: None,
         position: None,
         velocity: None,
         state_at: 0,
