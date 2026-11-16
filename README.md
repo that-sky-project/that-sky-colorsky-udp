@@ -97,11 +97,16 @@ The adapter connects to the manager WebSocket (`/` with `?v=1`), reconnects
 automatically, and reports:
 
 - `node.ready`, `room.created`
-- `player.join`, `player.leave`
+- `player.join`, `player.leave` — both carry the player's server-generated
+  `sessionId` (independent of the client's connection token) and the current
+  `lvSeq`, so the manager can distinguish a reconnected client from the old
+  session
 - `room.telemetry` once per second: a full snapshot first, then deltas with
   `kind`/`baseSeq`/`removedPlayers`; a full resync is sent every 30 frames or
-  30 seconds. Telemetry carries `capacity`, `load`, and each player's
-  `position`, `velocity`, `stateAt`, `lastMoveAt` and `affinity` when known.
+  30 seconds, and every player is re-sent at least every 2 seconds even when
+  idle. Telemetry carries `capacity`, `load`, and each player's `sessionId`,
+  `lvSeq`, `status`, `position`, `velocity`, `stateAt`, `lastMoveAt` and
+  `affinity` when known. A session change alone produces a delta.
 - `move.result` on failed or timed-out moves
 - `move.completed` once every player in a move group has landed
 - `reservation.expired` when a move hold times out before the group arrives
@@ -109,19 +114,24 @@ automatically, and reports:
 
 It handles these QWD commands and acknowledges each one:
 
-- `room.reserve`, `move.prepare`, `move.cancel`
+- `room.reserve`, `room.sync`, `move.prepare`, `move.renew`, `move.cancel`
 - `move.commit`, `player.redirect`
 - `node.drain`, `room.destroy`
 - `room.id_conflict`
 
-`move.prepare` honors the manager's `expectedVersion`; if the room's
-telemetry has advanced more than three snapshots past it, the node returns
-`4090 STALE_PLAN` instead of executing a plan built from old state.
+Repeated command ids with the same payload replay the cached ack; the same id
+with a different payload is rejected as a conflict. `move.commit` validates the
+manager's `expectedParticipants` guard strictly: when present it must match the
+player list one-to-one, and every guard (session, level, generation) is checked
+against the live connection before `MoveGame` is sent. A commit whose delivery
+deadline has expired is rejected.
 
 QWD reservations are counted against the eight-player room limit until the
-matching player joins or the reservation TTL expires. Room moves support single
-players, atomic groups and whole-level migration, including the migration
-roster on the destination node.
+matching player joins or the reservation TTL expires. A short manager socket
+loss caps the remaining lease instead of dropping it, so a reconnect inside the
+grace window keeps the reservation. Room moves support single players, atomic
+groups and whole-level migration, including the migration roster on the
+destination node.
 
 #### Debugging a room move
 

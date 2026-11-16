@@ -47,32 +47,66 @@ impl ManagerCommand {
         self.string_field("moveId")
     }
 
-    /// Accept both `playerIds: []` and `playerId: ""`.
-    pub fn player_ids(&self) -> Vec<String> {
+    /// Parse the singular/plural player id forms without silently repairing the
+    /// manager's request. Duplicate, empty, non-string, and mixed forms are
+    /// protocol errors because silently dropping one participant would weaken
+    /// the move's all-or-one guard.
+    pub fn player_ids(&self) -> Result<Vec<String>, String> {
         let mut ids = Vec::new();
+        let mut saw_field = false;
 
-        if let Some(values) = self.data.get("playerIds").and_then(Value::as_array) {
+        if let Some(value) = self.data.get("playerIds") {
+            saw_field = true;
+            let Some(values) = value.as_array() else {
+                return Err("playerIds must be an array of non-empty strings".to_string());
+            };
             for value in values {
-                if let Some(id) = value.as_str()
-                    && !ids.iter().any(|existing| existing == id)
-                {
-                    ids.push(id.to_string());
+                let Some(id) = value.as_str() else {
+                    return Err("playerIds must contain only strings".to_string());
+                };
+                if id.is_empty() {
+                    return Err("playerIds must not contain empty ids".to_string());
                 }
+                if ids.iter().any(|existing| existing == id) {
+                    return Err("playerIds must not contain duplicates".to_string());
+                }
+                ids.push(id.to_string());
             }
         }
 
-        if let Some(id) = self.string_field("playerId")
-            && !ids.iter().any(|existing| existing == id)
-        {
+        if let Some(value) = self.data.get("playerId") {
+            saw_field = true;
+            let Some(id) = value.as_str() else {
+                return Err("playerId must be a non-empty string".to_string());
+            };
+            if id.is_empty() {
+                return Err("playerId must be a non-empty string".to_string());
+            }
+            if ids.iter().any(|existing| existing == id) {
+                return Err("playerIds must not contain duplicates".to_string());
+            }
             ids.push(id.to_string());
         }
 
-        ids
+        if !saw_field {
+            return Ok(Vec::new());
+        }
+        Ok(ids)
     }
 
-    pub fn ttl(&self) -> std::time::Duration {
-        let ttl = self.u64_field("ttlMs").unwrap_or(DEFAULT_TTL_MS);
-        std::time::Duration::from_millis(ttl.clamp(1_000, MAX_TTL_MS))
+    /// Validate a manager supplied TTL. Missing TTL keeps the wire default;
+    /// present values must be integer milliseconds in the supported range.
+    pub fn ttl(&self) -> Result<std::time::Duration, String> {
+        let Some(value) = self.data.get("ttlMs") else {
+            return Ok(std::time::Duration::from_millis(DEFAULT_TTL_MS));
+        };
+        let Some(ttl) = value.as_u64() else {
+            return Err("ttlMs must be an integer number of milliseconds".to_string());
+        };
+        if !(1_000..=MAX_TTL_MS).contains(&ttl) {
+            return Err(format!("ttlMs must be between 1000 and {MAX_TTL_MS}"));
+        }
+        Ok(std::time::Duration::from_millis(ttl))
     }
 }
 
@@ -116,13 +150,16 @@ mod tests {
             r#"{"v":1,"id":7,"cmd":"move.commit","data":{"playerIds":["a","b","a"]}}"#,
         )
         .unwrap();
-        assert_eq!(plural.player_ids(), vec!["a", "b"]);
+        assert_eq!(
+            plural.player_ids().unwrap_err(),
+            "playerIds must not contain duplicates"
+        );
 
         let singular: ManagerCommand = serde_json::from_str(
             r#"{"v":1,"id":8,"cmd":"player.redirect","data":{"playerId":"a"}}"#,
         )
         .unwrap();
-        assert_eq!(singular.player_ids(), vec!["a"]);
+        assert_eq!(singular.player_ids().unwrap(), vec!["a"]);
     }
 
     #[test]
@@ -138,6 +175,6 @@ mod tests {
     fn ttl_is_clamped() {
         let command: ManagerCommand =
             serde_json::from_str(r#"{"id":1,"cmd":"room.reserve","data":{"ttlMs":1}}"#).unwrap();
-        assert_eq!(command.ttl(), std::time::Duration::from_secs(1));
+        assert_eq!(command.ttl().unwrap_err(), "ttlMs must be between 1000 and 120000");
     }
 }

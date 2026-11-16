@@ -29,7 +29,23 @@ impl QwdClient {
             .map(str::to_string)
             .unwrap_or_else(|| format!("redirect-{}-{}", now_ms(), command.id));
 
-        let player_ids = command.player_ids();
+        let player_ids = match command.player_ids() {
+            Ok(ids) => ids,
+            Err(message) => return Ok((BAD_REQUEST, Some(message), None)),
+        };
+        let deadline_ms = match command.data.get("expiresAt") {
+            None => None,
+            Some(value) => match value.as_u64() {
+                Some(deadline) if deadline > now_ms() => Some(deadline),
+                _ => {
+                    return Ok((
+                        STALE_PLAN,
+                        Some("invalid or expired move delivery deadline".into()),
+                        None,
+                    ));
+                }
+            },
+        };
         if player_ids.is_empty() || player_ids.len() > 7 {
             return Ok((
                 BAD_REQUEST,
@@ -51,33 +67,32 @@ impl QwdClient {
             .string_field("reservationToken")
             .map(str::to_string)
             .or_else(|| self.reservations.token_of(&move_id).map(str::to_string));
-        if let Some(guard) = command.data.get("expectedParticipants") {
-            for expected in expected_participants(guard) {
-                let Some(player) = status
-                    .player_list
+        let guards = match command.data.get("expectedParticipants") {
+            None => Vec::new(),
+            Some(value) => match expected_participants(value) {
+                Ok(guards) => guards,
+                Err(message) => return Ok((BAD_REQUEST, Some(message), None)),
+            },
+        };
+        if !guards.is_empty()
+            && (guards.len() != player_ids.len()
+                || guards
                     .iter()
-                    .find(|player| player.uuid == expected.player_id)
-                else {
-                    continue;
-                };
-                if !participant_matches(&expected, player) {
-                    self.send_move_result(
-                        socket,
-                        MoveReport {
-                            move_id: &move_id,
-                            accepted: false,
-                            moved: &[],
-                            failed: std::slice::from_ref(&expected.player_id),
-                            reason: Some("source_participant_changed"),
-                            token: reservation_token.as_deref(),
-                        },
-                    )?;
-                    return Ok((
-                        STALE_PLAN,
-                        Some("source participant changed".to_string()),
-                        Some(json!({ "playerId": expected.player_id })),
-                    ));
-                }
+                    .any(|guard| !player_ids.contains(&guard.player_id)))
+        {
+            return Ok((
+                BAD_REQUEST,
+                Some("participant guards must exactly match playerIds".into()),
+                None,
+            ));
+        }
+        for guard in &guards {
+            if !status
+                .player_list
+                .iter()
+                .any(|player| participant_matches(guard, player))
+            {
+                return Ok((STALE_PLAN, Some("source participant changed".into()), None));
             }
         }
 
@@ -186,7 +201,21 @@ impl QwdClient {
             return Ok((INTERNAL, Some(message), None));
         }
 
-        match self.control.move_players(net_ids, to_room_id) {
+        let execution_guards = guards
+            .iter()
+            .map(|guard| crate::control::ExpectedPlayerGuard {
+                player_id: uuid_to_net[&guard.player_id],
+                session_id: guard.session_id.clone(),
+                level_id: guard.level_id,
+                lv_seq: guard.lv_seq,
+            })
+            .collect();
+        match self.control.move_players_guarded(
+            net_ids,
+            to_room_id.to_string(),
+            execution_guards,
+            deadline_ms,
+        ) {
             Ok(ControlResponse::Move(outcome)) => {
                 if outcome.moved.is_empty() {
                     self.send_move_result(
@@ -217,8 +246,16 @@ impl QwdClient {
                     PendingQwdMove {
                         pending,
                         moved: Vec::new(),
-                        failed: Vec::new(),
-                        reason: None,
+                        failed: outcome
+                            .failed
+                            .iter()
+                            .filter_map(|id| net_to_uuid.get(id).cloned())
+                            .collect(),
+                        reason: if outcome.failed.is_empty() {
+                            None
+                        } else {
+                            Some("partial_source_rejection".into())
+                        },
                         token: reservation_token,
                     },
                 );

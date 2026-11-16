@@ -97,6 +97,8 @@ pub struct PeerEntry {
     /// Connection token bound by the first `JoinGame` packet. Every later
     /// client packet must carry the same token.
     pub conn_magic: Option<u32>,
+    /// Server-generated connection identity; independent of reusable client tokens.
+    pub control_session_id: String,
     /// Unix milliseconds of the last packet received from this client.
     pub last_seen_at_ms: u64,
     /// Latest client affinity entries, keyed by net player id.
@@ -128,6 +130,7 @@ impl PeerEntry {
             state: PeerState::Pending,
             connected_at: Instant::now(),
             conn_magic: None,
+            control_session_id: format!("{:032x}", rand::random::<u128>()),
             last_seen_at_ms: now_ms(),
             affinity: Vec::new(),
             player_delta: PlayerState::new(),
@@ -175,5 +178,21 @@ impl PeerEntry {
             self.state,
             PeerState::Active | PeerState::Moving | PeerState::Closed
         )
+    }
+}
+
+#[cfg(test)]
+mod connection_identity_tests {
+    use super::PeerEntry;
+
+    #[test]
+    fn client_token_reuse_never_reuses_control_session_identity() {
+        let mut old = PeerEntry::new(std::ptr::null_mut());
+        let mut replacement = PeerEntry::new(std::ptr::null_mut());
+        old.conn_magic = Some(7);
+        replacement.conn_magic = Some(7);
+        assert_ne!(old.control_session_id, replacement.control_session_id);
+        assert_eq!(old.conn_magic, replacement.conn_magic);
+        assert!(!replacement.control_session_id.is_empty());
     }
 }

@@ -27,11 +27,28 @@ pub(super) struct MoveReport<'a> {
 }
 
 impl QwdClient {
+    pub(super) fn send_business_event(
+        &mut self,
+        socket: &mut Socket,
+        value: &Value,
+    ) -> Result<(), String> {
+        self.pending_events
+            .enqueue(value.clone(), std::time::Instant::now())?;
+        self.flush_event_outbox(socket)
+    }
+
+    pub(super) fn flush_event_outbox(&mut self, socket: &mut Socket) -> Result<(), String> {
+        while let Some(value) = self.pending_events.front(std::time::Instant::now()) {
+            self.send_json(socket, &value)?;
+            self.pending_events.sent();
+        }
+        Ok(())
+    }
     /// Tell the manager that every player of a move group has landed. This is
     /// stronger than inferring completion from join/leave pairs, so the move
     /// transaction can settle even if a leave event was lost.
     pub(super) fn send_move_completed(
-        &self,
+        &mut self,
         socket: &mut Socket,
         completed: &CompletedMove,
     ) -> Result<(), String> {
@@ -62,13 +79,13 @@ impl QwdClient {
                 "timestamp": now_ms()
             })),
         );
-        self.send_json(socket, &value)
+        self.send_business_event(socket, &value)
     }
 
     /// Tell the manager that a target reservation expired before its group
     /// arrived, so it can fail the transaction immediately.
     pub(super) fn send_reservation_expired(
-        &self,
+        &mut self,
         socket: &mut Socket,
         expired: &ExpiredMove,
     ) -> Result<(), String> {
@@ -89,11 +106,11 @@ impl QwdClient {
                 "timestamp": now_ms()
             })),
         );
-        self.send_json(socket, &value)
+        self.send_business_event(socket, &value)
     }
 
     pub(super) fn send_move_result(
-        &self,
+        &mut self,
         socket: &mut Socket,
         report: MoveReport<'_>,
     ) -> Result<(), String> {
@@ -114,7 +131,7 @@ impl QwdClient {
             data["reservationToken"] = Value::String(token.to_string());
             data["phase"] = json!("source_commit");
         }
-        self.send_json(socket, &event("move.result", data))
+        self.send_business_event(socket, &event("move.result", data))
     }
 
     /// Strip the fields an older manager's strict schema does not know. The
@@ -155,13 +172,15 @@ impl QwdClient {
                 uuid,
                 level_id,
                 session_id,
+                lv_seq,
                 ..
             } => {
                 let player_id = format!("{uuid:?}");
                 let completed = self.reservations.confirm_player(&player_id);
                 let mut player = json!({
                     "playerId": player_id,
-                    "level": level_id
+                    "level": level_id,
+                    "lvSeq": lv_seq
                 });
                 if let Some(session) = session_id {
                     player["sessionId"] = json!(session.to_string());
@@ -173,25 +192,34 @@ impl QwdClient {
                         "player": player
                     }),
                 );
-                self.send_json(socket, &value)?;
+                self.send_business_event(socket, &value)?;
                 for completed_move in &completed {
                     self.send_move_completed(socket, completed_move)?;
                 }
                 Ok(())
             }
-            ServerEvent::PlayerLeft { uuid, .. } => {
+            ServerEvent::PlayerLeft {
+                uuid,
+                level_id,
+                session_id,
+                lv_seq,
+                ..
+            } => {
                 let player_id = format!("{uuid:?}");
-                let _ = self.reservations.confirm_player(&player_id);
+                // Leaving a source is not admission into a target reservation.
                 let value = event(
                     "player.leave",
                     json!({
                         "roomId": self.room_id,
                         "player": {
-                            "playerId": player_id
+                            "playerId": player_id,
+                            "level": level_id,
+                            "sessionId": session_id,
+                            "lvSeq": lv_seq
                         }
                     }),
                 );
-                self.send_json(socket, &value)
+                self.send_business_event(socket, &value)
             }
             ServerEvent::MoveFinished {
                 move_id,

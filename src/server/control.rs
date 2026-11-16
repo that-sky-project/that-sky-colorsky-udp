@@ -20,6 +20,53 @@ impl ServerState {
                 player_ids,
                 room_id,
             } => self.move_players(player_ids, &room_id),
+            ControlCommand::MovePlayersGuarded {
+                player_ids,
+                room_id,
+                expected,
+                deadline_ms,
+            } => {
+                if deadline_ms.is_some_and(|deadline| deadline <= super::peer::now_ms()) {
+                    return ControlResponse::error("move delivery deadline expired");
+                }
+                if player_ids.is_empty()
+                    || player_ids.len() > 7
+                    || player_ids
+                        .iter()
+                        .collect::<std::collections::HashSet<_>>()
+                        .len()
+                        != player_ids.len()
+                {
+                    return ControlResponse::error("invalid guarded move group");
+                }
+                if !expected.is_empty()
+                    && (expected.len() != player_ids.len()
+                        || expected
+                            .iter()
+                            .map(|guard| guard.player_id)
+                            .collect::<std::collections::HashSet<_>>()
+                            .len()
+                            != player_ids.len())
+                {
+                    return ControlResponse::error("incomplete source participant guards");
+                }
+                for guard in &expected {
+                    if !player_ids.contains(&guard.player_id)
+                        || !self.peers.values().any(|peer| {
+                            peer.is_active()
+                                && peer.player_id == guard.player_id
+                                && peer.control_session_id == guard.session_id
+                                && peer.level_id == guard.level_id
+                                && peer.lv_seq == guard.lv_seq
+                        })
+                    {
+                        return ControlResponse::error(
+                            "source participant changed during move preparation",
+                        );
+                    }
+                }
+                self.move_players(player_ids, &room_id)
+            }
             ControlCommand::MoveLevel { level_id, room_id } => self.move_level(level_id, &room_id),
             ControlCommand::CancelMove { player_id, reason } => {
                 self.cancel_player_move(player_id, reason)
@@ -86,7 +133,7 @@ impl ServerState {
                         level_id: peer.level_id,
                         lv_seq: peer.lv_seq,
                         moving: peer.state == PeerState::Moving,
-                        session_id: peer.conn_magic,
+                        session_id: Some(peer.control_session_id.clone()),
                         position: peer.player_delta.position,
                         velocity: peer.player_delta.velocity,
                         state_at: peer.player_delta.state_at_ms,
@@ -99,7 +146,7 @@ impl ServerState {
     }
 
     fn control_kick_player(&mut self, player_id: u8, reason: &str) -> ControlResponse {
-        let Some((uuid, level_id)) = self
+        let Some((uuid, level_id, session_id, lv_seq)) = self
             .peers
             .values_mut()
             .find(|peer| peer.player_id == player_id && peer.is_player())
@@ -112,7 +159,12 @@ impl ServerState {
                 peer.send(0, &wire, true);
                 peer.state = PeerState::Closed;
                 peer.disconnect_later(0);
-                (peer.uuid, peer.level_id)
+                (
+                    peer.uuid,
+                    peer.level_id,
+                    Some(peer.control_session_id.clone()),
+                    peer.lv_seq,
+                )
             })
         else {
             return ControlResponse::error(format!("player not found: {player_id}"));
@@ -122,6 +174,8 @@ impl ServerState {
             player_id,
             uuid,
             level_id,
+            session_id,
+            lv_seq,
         });
 
         ControlResponse::Ok
@@ -199,6 +253,76 @@ mod tests {
         assert_eq!(status.rooms.len(), 1);
         assert_eq!(status.rooms[0].id, "room-1");
         assert_eq!(status.rooms[0].port, 19133);
+    }
+
+    #[test]
+    fn status_uses_server_connection_identity_instead_of_client_token() {
+        let mut state = ServerState::default();
+        let mut peer = crate::server::peer::PeerEntry::new(std::ptr::null_mut());
+        peer.player_id = 1;
+        peer.state = PeerState::Active;
+        peer.conn_magic = Some(7);
+        let identity = peer.control_session_id.clone();
+        state.peers.insert(1, peer);
+        let status = state.status();
+        assert_eq!(
+            status.player_list[0].session_id.as_deref(),
+            Some(identity.as_str())
+        );
+        assert_ne!(identity, "7");
+    }
+
+    #[test]
+    fn guarded_execution_refuses_replacement_session_generation_and_expired_delivery() {
+        let mut state = ServerState::default();
+        let mut peer = crate::server::peer::PeerEntry::new(std::ptr::null_mut());
+        peer.player_id = 1;
+        peer.state = PeerState::Active;
+        peer.level_id = 7;
+        peer.lv_seq = 2;
+        let session_id = peer.control_session_id.clone();
+        state.peers.insert(1, peer);
+        for expected in [
+            crate::control::ExpectedPlayerGuard {
+                player_id: 1,
+                session_id: "old".into(),
+                level_id: 7,
+                lv_seq: 2,
+            },
+            crate::control::ExpectedPlayerGuard {
+                player_id: 1,
+                session_id: session_id.clone(),
+                level_id: 6,
+                lv_seq: 2,
+            },
+            crate::control::ExpectedPlayerGuard {
+                player_id: 1,
+                session_id: session_id.clone(),
+                level_id: 7,
+                lv_seq: 1,
+            },
+        ] {
+            let response = state.handle_control(ControlCommand::MovePlayersGuarded {
+                player_ids: vec![1],
+                room_id: "target".into(),
+                expected: vec![expected],
+                deadline_ms: None,
+            });
+            assert!(
+                matches!(response, ControlResponse::Error { message } if message.contains("participant changed"))
+            );
+        }
+        let response = state.handle_control(ControlCommand::MovePlayersGuarded {
+            player_ids: vec![1],
+            room_id: "target".into(),
+            expected: vec![],
+            deadline_ms: Some(1),
+        });
+        assert!(
+            matches!(response, ControlResponse::Error { message } if message.contains("deadline expired"))
+        );
+        assert_eq!(state.pending_moves.len(), 0);
+        assert!(state.peers[&1].is_active());
     }
 
     #[test]

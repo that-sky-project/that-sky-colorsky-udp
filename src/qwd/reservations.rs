@@ -76,6 +76,29 @@ impl Reservations {
         self.moves.clear();
     }
 
+    /// Preserve business leases across a short socket loss without extending them.
+    pub fn cap_transport_loss(&mut self, now: Instant, grace: Duration) {
+        let limit = now + grace;
+        for hold in self.players.values_mut() {
+            hold.expires_at = hold.expires_at.min(limit);
+        }
+        for hold in self.moves.values_mut() {
+            hold.expires_at = hold.expires_at.min(limit);
+        }
+    }
+
+    #[allow(dead_code)] // retained for targeted partial-cancellation follow-up
+    pub fn cancel_members(&mut self, move_id: &str, player_ids: &[String]) {
+        if let Some(hold) = self.moves.get_mut(move_id) {
+            for id in player_ids {
+                hold.pending.remove(id);
+            }
+            if hold.pending.is_empty() {
+                self.moves.remove(move_id);
+            }
+        }
+    }
+
     /// Unique player ids currently reserved by any hold.
     pub fn reserved_players(&self, now: Instant) -> HashSet<String> {
         let mut reserved = HashSet::new();
@@ -127,7 +150,11 @@ impl Reservations {
             .min(capacity.saturating_sub(physical_players));
         CapacityFacts {
             physical_players,
-            active_players: physical_players,
+            active_players: status
+                .player_list
+                .iter()
+                .filter(|player| !player.moving)
+                .count(),
             reserved_slots: reserved,
             capacity,
             version,
@@ -141,6 +168,7 @@ impl Reservations {
     }
 
     pub fn reserve_player(&mut self, player_id: &str, ttl: Duration, now: Instant) -> String {
+        self.players.retain(|_, hold| hold.expires_at > now);
         if let Some(existing) = self.players.get_mut(player_id) {
             existing.expires_at = now + ttl;
             return existing.token.clone();
@@ -170,6 +198,7 @@ impl Reservations {
         now: Instant,
         requested_token: Option<&str>,
     ) -> Result<String, ReserveMoveError> {
+        self.moves.retain(|_, hold| hold.expires_at > now);
         let requested: HashSet<&String> = player_ids.iter().collect();
 
         if let Some(existing) = self.moves.get_mut(move_id) {
@@ -235,7 +264,9 @@ impl Reservations {
 
         let mut completed = Vec::new();
         for (move_id, reservation) in &mut self.moves {
-            reservation.pending.remove(player_id);
+            if !reservation.pending.remove(player_id) {
+                continue;
+            }
             reservation.joined.insert(player_id.to_string());
             if reservation.pending.is_empty() {
                 completed.push(CompletedMove {
