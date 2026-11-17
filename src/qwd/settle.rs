@@ -177,14 +177,12 @@ impl QwdClient {
             } => {
                 let player_id = format!("{uuid:?}");
                 let completed = self.reservations.confirm_player(&player_id);
-                let mut player = json!({
+                let player = json!({
                     "playerId": player_id,
                     "level": level_id,
+                    "sessionId": session_id,
                     "lvSeq": lv_seq
                 });
-                if let Some(session) = session_id {
-                    player["sessionId"] = json!(session.to_string());
-                }
                 let value = event(
                     "player.join",
                     json!({

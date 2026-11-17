@@ -115,10 +115,7 @@ impl ServerState {
             self.complete_migration_roster(&key);
         }
 
-        let session_id = self
-            .peers
-            .get(&peer_key)
-            .map(|peer| peer.control_session_id.clone());
+        let session_id = self.peers.get(&peer_key)?.control_session_id.clone();
         self.emit_event(ServerEvent::PlayerJoined {
             player_id,
             uuid: join.uuid,

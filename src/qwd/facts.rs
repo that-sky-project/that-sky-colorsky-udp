@@ -121,6 +121,7 @@ mod tests {
             uuid: "p".into(),
             session_id: "new".into(),
             is_host: false,
+            level_hash: None,
             level_id: 7,
             lv_seq: 1,
             moving: false,

@@ -62,7 +62,7 @@ impl ServerState {
                     player_id: entry.player_id,
                     uuid: entry.uuid,
                     level_id: entry.level_id,
-                    session_id: Some(entry.control_session_id.clone()),
+                    session_id: entry.control_session_id.clone(),
                     lv_seq: entry.lv_seq,
                 });
             }

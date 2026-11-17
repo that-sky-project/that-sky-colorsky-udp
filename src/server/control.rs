@@ -55,6 +55,7 @@ impl ServerState {
                         || !self.peers.values().any(|peer| {
                             peer.is_active()
                                 && peer.player_id == guard.player_id
+                                && format!("{:?}", peer.uuid) == guard.uuid
                                 && peer.control_session_id == guard.session_id
                                 && peer.level_id == guard.level_id
                                 && peer.lv_seq == guard.lv_seq
@@ -63,6 +64,28 @@ impl ServerState {
                         return ControlResponse::error(
                             "source participant changed during move preparation",
                         );
+                    }
+                }
+                let selected: std::collections::HashSet<u8> =
+                    player_ids.iter().copied().collect();
+                for peer in self.peers.values().filter(|peer| peer.is_player()) {
+                    let peer_selected = selected.contains(&peer.player_id);
+                    for bond in &peer.affinity {
+                        if bond.value < 230 {
+                            continue;
+                        }
+                        let Some(target) = self.peers.values().find(|target| {
+                            target.is_player()
+                                && target.uuid == bond.uuid
+                                && target.control_session_id == bond.session_id
+                        }) else {
+                            continue;
+                        };
+                        if peer_selected != selected.contains(&target.player_id) {
+                            return ControlResponse::error(
+                                "hard-bonded peer is outside the guarded move group",
+                            );
+                        }
                     }
                 }
                 self.move_players(player_ids, &room_id)
@@ -101,17 +124,6 @@ impl ServerState {
 
     /// Snapshot used by control callers.
     pub(crate) fn status(&self) -> ServerStatus {
-        // The host is the active (connected, not moving) player with the
-        // earliest registration time, ties broken by the lowest player id.
-        // Recomputing it here makes a departing host hand over automatically:
-        // join, leave and move finalization all change the peer table, and
-        // every telemetry build fetches a fresh snapshot.
-        let host_player_id = self
-            .peers
-            .values()
-            .filter(|peer| peer.is_active())
-            .min_by_key(|peer| (peer.joined_at, peer.player_id))
-            .map(|peer| peer.player_id);
         ServerStatus {
             addr: self.bind_addr.clone(),
             peers: self.peers.len(),
@@ -124,12 +136,17 @@ impl ServerState {
                 .values()
                 .filter(|peer| peer.is_player())
                 .map(|peer| {
-                    // Affinity edges were frozen at receive time as UUID-keyed
-                    // bonds; publishing them needs no live resolution.
                     let affinity: Vec<(String, f32)> = peer
                         .affinity
                         .iter()
-                        .map(|(uuid, value)| (format!("{uuid:?}"), f32::from(*value) / 255.0))
+                        .filter(|bond| {
+                            self.peers.values().any(|target| {
+                                target.is_player()
+                                    && target.uuid == bond.uuid
+                                    && target.control_session_id == bond.session_id
+                            })
+                        })
+                        .map(|bond| (format!("{:?}", bond.uuid), f32::from(bond.value) / 255.0))
                         .collect();
                     PlayerInfo {
                         player_id: peer.player_id,
@@ -138,7 +155,11 @@ impl ServerState {
                         lv_seq: peer.lv_seq,
                         moving: peer.state == PeerState::Moving,
                         session_id: peer.control_session_id.clone(),
-                        is_host: host_player_id == Some(peer.player_id),
+                        is_host: self.level_authority.get(&peer.level_id) == Some(&peer.player_id),
+                        level_hash: self
+                            .levels_data
+                            .get(&peer.level_id)
+                            .map(|level| level.header.level_hash),
                         position: peer.player_delta.position,
                         velocity: peer.player_delta.velocity,
                         state_at: peer.player_delta.state_at_ms,
@@ -167,7 +188,7 @@ impl ServerState {
                 (
                     peer.uuid,
                     peer.level_id,
-                    Some(peer.control_session_id.clone()),
+                    peer.control_session_id.clone(),
                     peer.lv_seq,
                 )
             })
@@ -317,18 +338,21 @@ mod tests {
         for expected in [
             crate::control::ExpectedPlayerGuard {
                 player_id: 1,
+                uuid: format!("{:?}", state.peers[&1].uuid),
                 session_id: "old".into(),
                 level_id: 7,
                 lv_seq: 2,
             },
             crate::control::ExpectedPlayerGuard {
                 player_id: 1,
+                uuid: format!("{:?}", state.peers[&1].uuid),
                 session_id: session_id.clone(),
                 level_id: 6,
                 lv_seq: 2,
             },
             crate::control::ExpectedPlayerGuard {
                 player_id: 1,
+                uuid: format!("{:?}", state.peers[&1].uuid),
                 session_id: session_id.clone(),
                 level_id: 7,
                 lv_seq: 1,

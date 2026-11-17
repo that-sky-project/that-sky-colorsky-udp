@@ -59,6 +59,7 @@ fn test_player(session: &str) -> PlayerInfo {
         moving: false,
         session_id: session.into(),
         is_host: false,
+        level_hash: None,
         position: Some([1.0, 2.0, 3.0]),
         velocity: None,
         state_at: 100,
@@ -481,6 +482,7 @@ fn bond_player(player_id: u8, uuid: &TgcUuid, bonded: Option<&TgcUuid>, value: u
         moving: false,
         session_id: format!("bond-{player_id}"),
         is_host: false,
+        level_hash: None,
         position: None,
         velocity: None,
         state_at: 0,
@@ -852,7 +854,7 @@ fn falls_back_to_move_result_on_old_managers() {
                 player_id: 1,
                 uuid: player_uuid,
                 level_id: 42,
-                session_id: Some("s7".into()),
+                session_id: "s7".into(),
                 lv_seq: 8,
             })
             .unwrap();
@@ -881,6 +883,7 @@ fn registers_and_answers_qwd_commands() {
         moving: false,
         session_id: "s9".into(),
         is_host: false,
+        level_hash: None,
         position: None,
         velocity: None,
         state_at: 0,
@@ -955,7 +958,7 @@ fn registers_and_answers_qwd_commands() {
                 player_id: 1,
                 uuid: player_uuid,
                 level_id: 0,
-                session_id: Some("s9".into()),
+                session_id: "s9".into(),
                 lv_seq: 0,
             })
             .unwrap();

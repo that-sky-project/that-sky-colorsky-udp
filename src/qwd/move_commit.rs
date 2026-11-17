@@ -29,24 +29,25 @@ const BOND_THRESHOLD: f32 = 0.9;
 /// that is still connected outside the group rejects the whole commit.
 /// Returns the rejection message naming both players for the first violation.
 fn bond_conflict(player_list: &[PlayerInfo], moving_group: &[String]) -> Option<String> {
-    let connected: HashSet<&str> = player_list
-        .iter()
-        .map(|player| player.uuid.as_str())
-        .collect();
+    let moving: HashSet<&str> = moving_group.iter().map(String::as_str).collect();
     for player in player_list {
-        if !moving_group.iter().any(|id| id == &player.uuid) {
-            continue;
-        }
+        let player_moves = moving.contains(player.uuid.as_str());
         for (peer_uuid, weight) in &player.affinity {
             if *weight < BOND_THRESHOLD {
                 continue;
             }
-            let in_group = moving_group.iter().any(|id| id == peer_uuid);
-            if !in_group && connected.contains(peer_uuid.as_str()) {
+            let Some(peer) = player_list.iter().find(|peer| peer.uuid == *peer_uuid) else {
+                continue;
+            };
+            let peer_moves = moving.contains(peer.uuid.as_str());
+            if player_moves != peer_moves {
+                let (moving_player, outside_peer) = if player_moves {
+                    (&player.uuid, &peer.uuid)
+                } else {
+                    (&peer.uuid, &player.uuid)
+                };
                 return Some(format!(
-                    "player {} cannot move: bonded peer {} (affinity {weight:.3}) is still \
-                     connected in this room and not in the moving group",
-                    player.uuid, peer_uuid
+                    "player {moving_player} cannot move: bonded peer {outside_peer} (affinity {weight:.3}) is still connected in this room and not in the moving group"
                 ));
             }
         }
@@ -260,6 +261,7 @@ impl QwdClient {
             .iter()
             .map(|guard| crate::control::ExpectedPlayerGuard {
                 player_id: uuid_to_net[&guard.player_id],
+                uuid: guard.player_id.clone(),
                 session_id: guard.session_id.clone(),
                 level_id: guard.level_id,
                 lv_seq: guard.lv_seq,
@@ -384,6 +386,7 @@ mod tests {
             moving: false,
             session_id: format!("{uuid}-session"),
             is_host: false,
+            level_hash: None,
             position: None,
             velocity: None,
             state_at: 0,

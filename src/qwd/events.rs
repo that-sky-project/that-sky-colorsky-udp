@@ -256,6 +256,7 @@ fn same_telemetry(a: &Value, b: &Value) -> bool {
         && a.get("status") == b.get("status")
         && a.get("lvSeq") == b.get("lvSeq")
         && a.get("isHost") == b.get("isHost")
+        && a.get("levelHash") == b.get("levelHash")
 }
 
 /// Shape one player's QWD telemetry entry. Optional fields mirror XYSKY, which
@@ -271,6 +272,9 @@ fn player_telemetry(player: &PlayerInfo, status_fields: bool) -> Value {
     value["sessionId"] = json!(player.session_id);
     value["lvSeq"] = json!(player.lv_seq);
     value["isHost"] = json!(player.is_host);
+    if let Some(level_hash) = player.level_hash {
+        value["levelHash"] = json!(level_hash);
+    }
     if status_fields {
         value["status"] = json!(player_status(player.moving));
     }
@@ -318,6 +322,7 @@ mod tests {
             moving: false,
             session_id: "session-1".to_string(),
             is_host: false,
+            level_hash: None,
             position: Some([1.0, 2.0, 3.0]),
             velocity: Some(4.0),
             state_at: 100,

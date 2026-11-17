@@ -145,8 +145,6 @@ pub struct PlayerInfo {
     /// It is independent of the token supplied in the client's packet header.
     /// Mandatory: every telemetry entry for a connected peer carries it.
     pub session_id: String,
-    /// True after disconnect/kick initiation, until the physical ENet disconnect.
-    pub closed: bool,
     /// Actual per-level authority used by Elect, not a separate room host.
     /// A mixed-level room can temporarily have multiple authorities.
     pub is_host: bool,

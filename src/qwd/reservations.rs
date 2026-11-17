@@ -487,6 +487,7 @@ mod tests {
                     moving: false,
                     session_id: format!("session-{index}"),
                     is_host: false,
+                    level_hash: None,
                     position: None,
                     velocity: None,
                     state_at: 0,
