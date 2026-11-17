@@ -101,6 +101,17 @@ impl ServerState {
 
     /// Snapshot used by control callers.
     pub(crate) fn status(&self) -> ServerStatus {
+        // The host is the active (connected, not moving) player with the
+        // earliest registration time, ties broken by the lowest player id.
+        // Recomputing it here makes a departing host hand over automatically:
+        // join, leave and move finalization all change the peer table, and
+        // every telemetry build fetches a fresh snapshot.
+        let host_player_id = self
+            .peers
+            .values()
+            .filter(|peer| peer.is_active())
+            .min_by_key(|peer| (peer.joined_at, peer.player_id))
+            .map(|peer| peer.player_id);
         ServerStatus {
             addr: self.bind_addr.clone(),
             peers: self.peers.len(),
@@ -113,19 +124,12 @@ impl ServerState {
                 .values()
                 .filter(|peer| peer.is_player())
                 .map(|peer| {
+                    // Affinity edges were frozen at receive time as UUID-keyed
+                    // bonds; publishing them needs no live resolution.
                     let affinity: Vec<(String, f32)> = peer
                         .affinity
                         .iter()
-                        .filter_map(|entry| {
-                            self.peers
-                                .values()
-                                .find(|other| {
-                                    other.player_id == entry.net_player_id && other.is_player()
-                                })
-                                .map(|other| {
-                                    (format!("{:?}", other.uuid), f32::from(entry.value) / 255.0)
-                                })
-                        })
+                        .map(|(uuid, value)| (format!("{uuid:?}"), f32::from(*value) / 255.0))
                         .collect();
                     PlayerInfo {
                         player_id: peer.player_id,
@@ -133,7 +137,8 @@ impl ServerState {
                         level_id: peer.level_id,
                         lv_seq: peer.lv_seq,
                         moving: peer.state == PeerState::Moving,
-                        session_id: Some(peer.control_session_id.clone()),
+                        session_id: peer.control_session_id.clone(),
+                        is_host: host_player_id == Some(peer.player_id),
                         position: peer.player_delta.position,
                         velocity: peer.player_delta.velocity,
                         state_at: peer.player_delta.state_at_ms,
@@ -224,9 +229,39 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use crate::control::RoomEndpoint;
+    use crate::protocol::game_msg::{GameMsg, GameMsgId};
     use crate::protocol::net_address::NetAddress;
+    use crate::protocol::types::TgcUuid;
 
     use super::*;
+
+    fn active_peer(player_id: u8, uuid: TgcUuid) -> crate::server::peer::PeerEntry {
+        let mut peer = crate::server::peer::PeerEntry::new(std::ptr::null_mut());
+        peer.player_id = player_id;
+        peer.uuid = uuid;
+        peer.state = PeerState::Active;
+        peer
+    }
+
+    /// Build a client `Affinity` payload: a compressed count (four bits, one
+    /// byte for up to eight entries) followed by `(net_player_id, value)`.
+    fn affinity_msg(entries: &[(u8, u8)]) -> GameMsg {
+        let mut payload = vec![entries.len() as u8];
+        for (net_player_id, value) in entries {
+            payload.push(*net_player_id);
+            payload.push(*value);
+        }
+        GameMsg::new(GameMsgId::Affinity, 0, 0, &payload)
+    }
+
+    fn player_of<'a>(status: &'a ServerStatus, uuid: &TgcUuid) -> &'a PlayerInfo {
+        let text = format!("{uuid:?}");
+        status
+            .player_list
+            .iter()
+            .find(|player| player.uuid == text)
+            .unwrap()
+    }
 
     #[test]
     fn status_lists_registered_rooms() {
@@ -265,10 +300,7 @@ mod tests {
         let identity = peer.control_session_id.clone();
         state.peers.insert(1, peer);
         let status = state.status();
-        assert_eq!(
-            status.player_list[0].session_id.as_deref(),
-            Some(identity.as_str())
-        );
+        assert_eq!(status.player_list[0].session_id, identity);
         assert_ne!(identity, "7");
     }
 
@@ -334,5 +366,131 @@ mod tests {
         });
 
         assert!(!response.is_ok());
+    }
+
+    #[test]
+    fn affinity_freezes_bonded_uuid_and_survives_net_id_reuse() {
+        let mut state = ServerState::default();
+        let first = TgcUuid::from(&[1u8; 16]).unwrap();
+        let second = TgcUuid::from(&[2u8; 16]).unwrap();
+        let replacement = TgcUuid::from(&[3u8; 16]).unwrap();
+        state.peers.insert(1, active_peer(1, first));
+        state.peers.insert(2, active_peer(2, second));
+
+        assert!(
+            state
+                .handle_affinity(1, affinity_msg(&[(2, 230)]))
+                .is_some()
+        );
+        let status = state.status();
+        assert_eq!(
+            player_of(&status, &first).affinity,
+            vec![(format!("{second:?}"), 230.0f32 / 255.0)]
+        );
+
+        // Player 2 leaves and a different client takes native id 2. The frozen
+        // bond must still point at the original uuid, not the newcomer's.
+        state.peers.remove(&2);
+        state.peers.insert(2, active_peer(2, replacement));
+        let status = state.status();
+        assert_eq!(
+            player_of(&status, &first).affinity,
+            vec![(format!("{second:?}"), 230.0f32 / 255.0)]
+        );
+    }
+
+    #[test]
+    fn affinity_entries_without_a_connected_peer_are_not_frozen() {
+        let mut state = ServerState::default();
+        let first = TgcUuid::from(&[1u8; 16]).unwrap();
+        state.peers.insert(1, active_peer(1, first));
+
+        // Native id 5 belongs to nobody; deferring the entry would let a later
+        // id reuse misattribute the bond, so it is dropped instead.
+        assert!(
+            state
+                .handle_affinity(1, affinity_msg(&[(5, 255)]))
+                .is_some()
+        );
+        let status = state.status();
+        assert!(player_of(&status, &first).affinity.is_empty());
+
+        // A second update replaces the whole frozen set.
+        let second = TgcUuid::from(&[2u8; 16]).unwrap();
+        state.peers.insert(2, active_peer(2, second));
+        assert!(state.handle_affinity(1, affinity_msg(&[(2, 10)])).is_some());
+        let status = state.status();
+        assert_eq!(
+            player_of(&status, &first).affinity,
+            vec![(format!("{second:?}"), 10.0f32 / 255.0)]
+        );
+    }
+
+    #[test]
+    fn host_is_earliest_active_player_and_hands_over_automatically() {
+        let mut state = ServerState::default();
+        let first = TgcUuid::from(&[1u8; 16]).unwrap();
+        let second = TgcUuid::from(&[2u8; 16]).unwrap();
+        let mut host = active_peer(1, first);
+        host.joined_at = 1_000;
+        let mut joining = active_peer(2, second);
+        joining.joined_at = 2_000;
+        state.peers.insert(1, host);
+        state.peers.insert(2, joining);
+
+        let status = state.status();
+        assert!(player_of(&status, &first).is_host);
+        assert!(!player_of(&status, &second).is_host);
+
+        // A replacement session for the same client is a new peer entry with a
+        // later registration time, so the older player keeps the host role.
+        let mut replacement = active_peer(2, second);
+        replacement.joined_at = 3_000;
+        state.peers.remove(&2);
+        state.peers.insert(2, replacement);
+        let status = state.status();
+        assert!(player_of(&status, &first).is_host);
+        assert!(!player_of(&status, &second).is_host);
+
+        // The host departs: the remaining player takes over on the next
+        // snapshot without any explicit handover step.
+        state.peers.remove(&1);
+        let status = state.status();
+        assert!(player_of(&status, &second).is_host);
+    }
+
+    #[test]
+    fn moving_player_is_never_host() {
+        let mut state = ServerState::default();
+        let first = TgcUuid::from(&[1u8; 16]).unwrap();
+        let second = TgcUuid::from(&[2u8; 16]).unwrap();
+        let mut migrating = active_peer(1, first);
+        migrating.joined_at = 500;
+        migrating.state = PeerState::Moving;
+        let mut staying = active_peer(2, second);
+        staying.joined_at = 600;
+        state.peers.insert(1, migrating);
+        state.peers.insert(2, staying);
+
+        let status = state.status();
+        assert!(!player_of(&status, &first).is_host);
+        assert!(player_of(&status, &second).is_host);
+    }
+
+    #[test]
+    fn host_tie_breaks_to_lowest_player_id() {
+        let mut state = ServerState::default();
+        let fifth = TgcUuid::from(&[5u8; 16]).unwrap();
+        let third = TgcUuid::from(&[3u8; 16]).unwrap();
+        let mut a = active_peer(5, fifth);
+        a.joined_at = 700;
+        let mut b = active_peer(3, third);
+        b.joined_at = 700;
+        state.peers.insert(5, a);
+        state.peers.insert(3, b);
+
+        let status = state.status();
+        assert!(player_of(&status, &third).is_host);
+        assert!(!player_of(&status, &fifth).is_host);
     }
 }

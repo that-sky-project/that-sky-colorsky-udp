@@ -245,7 +245,8 @@ impl QwdClient {
 
 /// Compare only the fields XYSKY uses to decide whether a player changed.
 /// Timestamps move on every packet and must not defeat delta compression; the
-/// move status is compared so a transition to/from MOVING is always published.
+/// move status and host flag are compared so a transition to/from MOVING and a
+/// host handover are always published.
 fn same_telemetry(a: &Value, b: &Value) -> bool {
     a.get("sessionId") == b.get("sessionId")
         && a.get("levelId") == b.get("levelId")
@@ -254,6 +255,7 @@ fn same_telemetry(a: &Value, b: &Value) -> bool {
         && a.get("affinity") == b.get("affinity")
         && a.get("status") == b.get("status")
         && a.get("lvSeq") == b.get("lvSeq")
+        && a.get("isHost") == b.get("isHost")
 }
 
 /// Shape one player's QWD telemetry entry. Optional fields mirror XYSKY, which
@@ -263,12 +265,12 @@ fn player_telemetry(player: &PlayerInfo, status_fields: bool) -> Value {
         "playerId": player.uuid,
         "levelId": player.level_id,
     });
-    if let Some(session) = &player.session_id {
-        value["sessionId"] = json!(session);
-    }
-    // Session identity and level generation are mandatory safety metadata,
-    // even when an older manager rejects optional player status fields.
+    // Session identity, level generation and the host flag are mandatory
+    // safety metadata on every entry, even when an older manager rejects
+    // optional player status fields.
+    value["sessionId"] = json!(player.session_id);
     value["lvSeq"] = json!(player.lv_seq);
+    value["isHost"] = json!(player.is_host);
     if status_fields {
         value["status"] = json!(player_status(player.moving));
     }
@@ -314,7 +316,8 @@ mod tests {
             level_id,
             lv_seq: 0,
             moving: false,
-            session_id: None,
+            session_id: "session-1".to_string(),
+            is_host: false,
             position: Some([1.0, 2.0, 3.0]),
             velocity: Some(4.0),
             state_at: 100,
@@ -341,5 +344,25 @@ mod tests {
         assert_eq!(value["position"], json!([1.0, 2.0, 3.0]));
         assert_eq!(value["velocity"], json!(4.0));
         assert_eq!(value["affinity"]["player-2"], json!(0.5));
+    }
+
+    #[test]
+    fn telemetry_entry_always_carries_session_id_and_host_flag() {
+        // sessionId, lvSeq and isHost are mandatory on every entry, even with
+        // the optional status fields disabled for an older manager.
+        for status_fields in [true, false] {
+            let value = player_telemetry(&player(7), status_fields);
+            assert_eq!(value["sessionId"], json!("session-1"));
+            assert_eq!(value["lvSeq"], json!(0));
+            assert_eq!(value["isHost"], json!(false));
+        }
+    }
+
+    #[test]
+    fn host_flag_change_is_a_telemetry_change() {
+        let base = player_telemetry(&player(7), true);
+        let mut promoted = player(7);
+        promoted.is_host = true;
+        assert!(!same_telemetry(&base, &player_telemetry(&promoted, true)));
     }
 }

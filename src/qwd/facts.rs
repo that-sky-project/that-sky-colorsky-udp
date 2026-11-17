@@ -78,7 +78,7 @@ pub fn expected_participants(value: &Value) -> Result<Vec<ExpectedParticipant>, 
 
 pub fn participant_matches(expected: &ExpectedParticipant, player: &PlayerInfo) -> bool {
     expected.player_id == player.uuid
-        && player.session_id.as_deref() == Some(expected.session_id.as_str())
+        && player.session_id == expected.session_id
         && expected.level_id == player.level_id
         && expected.lv_seq == player.lv_seq
         && !player.moving
@@ -119,7 +119,8 @@ mod tests {
         let mut player = PlayerInfo {
             player_id: 1,
             uuid: "p".into(),
-            session_id: Some("new".into()),
+            session_id: "new".into(),
+            is_host: false,
             level_id: 7,
             lv_seq: 1,
             moving: false,
@@ -130,9 +131,11 @@ mod tests {
             affinity: vec![],
         };
         assert!(participant_matches(&expected, &player));
-        player.session_id = Some("old".into());
+        // A replacement session for the same client is a different connection
+        // and must not satisfy the guard.
+        player.session_id = "old".into();
         assert!(!participant_matches(&expected, &player));
-        player.session_id = None;
+        player.session_id = String::new();
         assert!(!participant_matches(&expected, &player));
     }
     #[test]

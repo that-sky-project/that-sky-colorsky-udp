@@ -57,7 +57,8 @@ fn test_player(session: &str) -> PlayerInfo {
         level_id: 7,
         lv_seq: 8,
         moving: false,
-        session_id: Some(session.into()),
+        session_id: session.into(),
+        is_host: false,
         position: Some([1.0, 2.0, 3.0]),
         velocity: None,
         state_at: 100,
@@ -67,14 +68,18 @@ fn test_player(session: &str) -> PlayerInfo {
 }
 
 fn test_status(player: PlayerInfo) -> ServerStatus {
+    test_status_players(vec![player])
+}
+
+fn test_status_players(players: Vec<PlayerInfo>) -> ServerStatus {
     ServerStatus {
         addr: "127.0.0.1:0".into(),
-        peers: 1,
-        players: 1,
+        peers: players.len(),
+        players: players.len(),
         pending_moves: 0,
         draining: false,
         rooms: Vec::new(),
-        player_list: vec![player],
+        player_list: players,
     }
 }
 
@@ -180,6 +185,84 @@ fn telemetry_delta_failure_and_idle_tick_do_not_commit() {
     assert_eq!(client.telemetry_seq, 1);
     assert_eq!(client.telemetry_roster, baseline);
     assert_eq!(client.last_telemetry_sent_at, sent_at);
+}
+
+#[test]
+fn host_handover_publishes_a_telemetry_delta() {
+    let mut client = test_client();
+    let mut host = test_player("host");
+    host.is_host = true;
+    let mut other = test_player("other");
+    other.player_id = 2;
+    other.uuid = "player-2".into();
+    let status = test_status_players(vec![host.clone(), other.clone()]);
+    client.publish_telemetry(&status, |_, _| Ok(())).unwrap();
+
+    // The departing host hands over: the flags swap and the change must be
+    // published even though nothing else about either player moved.
+    host.is_host = false;
+    other.is_host = true;
+    let handed_over = test_status_players(vec![host, other]);
+    let mut sent = Value::Null;
+    client
+        .publish_telemetry(&handed_over, |_, value| {
+            sent = value.clone();
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(sent["data"]["kind"], "delta");
+    let players = sent["data"]["players"].as_array().unwrap();
+    assert_eq!(players.len(), 2);
+    assert!(
+        players
+            .iter()
+            .any(|player| player["playerId"] == "player-1" && player["isHost"] == false)
+    );
+    assert!(
+        players
+            .iter()
+            .any(|player| player["playerId"] == "player-2" && player["isHost"] == true)
+    );
+}
+
+#[test]
+fn every_telemetry_entry_carries_session_id_on_full_and_delta_frames() {
+    let mut client = test_client();
+    let first = test_player("s1");
+    let mut second = test_player("s2");
+    second.player_id = 2;
+    second.uuid = "player-2".into();
+    let status = test_status_players(vec![first.clone(), second.clone()]);
+
+    let mut sent = Value::Null;
+    client
+        .publish_telemetry(&status, |_, value| {
+            sent = value.clone();
+            Ok(())
+        })
+        .unwrap();
+    let full = sent["data"]["players"].as_array().unwrap().to_vec();
+    assert_eq!(full.len(), 2);
+    for entry in &full {
+        assert!(entry["sessionId"].is_string());
+        assert!(!entry["sessionId"].as_str().unwrap().is_empty());
+    }
+
+    // A session change alone is a delta, and the resent entry still carries
+    // its sessionId.
+    second.session_id = "s2-replaced".into();
+    let replaced = test_status_players(vec![first, second]);
+    client
+        .publish_telemetry(&replaced, |_, value| {
+            sent = value.clone();
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(sent["data"]["kind"], "delta");
+    let delta = sent["data"]["players"].as_array().unwrap();
+    assert_eq!(delta.len(), 1);
+    assert_eq!(delta[0]["playerId"], "player-2");
+    assert_eq!(delta[0]["sessionId"], "s2-replaced");
 }
 
 #[test]
@@ -388,20 +471,266 @@ fn generated_room_id_is_decimal() {
     }
 }
 
+/// A telemetry-shape player with an optional frozen affinity bond.
+fn bond_player(player_id: u8, uuid: &TgcUuid, bonded: Option<&TgcUuid>, value: u8) -> PlayerInfo {
+    PlayerInfo {
+        player_id,
+        uuid: format!("{uuid:?}"),
+        level_id: 7,
+        lv_seq: 3,
+        moving: false,
+        session_id: format!("bond-{player_id}"),
+        is_host: false,
+        position: None,
+        velocity: None,
+        state_at: 0,
+        last_move_at: 0,
+        affinity: bonded
+            .map(|peer| vec![(format!("{peer:?}"), f32::from(value) / 255.0)])
+            .unwrap_or_default(),
+    }
+}
+
+fn drain_commands(receiver: &mpsc::Receiver<ControlCommand>) -> Vec<ControlCommand> {
+    let mut commands = Vec::new();
+    while let Ok(command) = receiver.recv_timeout(Duration::from_millis(100)) {
+        commands.push(command);
+    }
+    commands
+}
+
+#[test]
+fn move_commit_rejects_a_connected_bonded_peer_left_outside_the_group() {
+    let mover_uuid = TgcUuid::from(&[1u8; 16]).unwrap();
+    let bonded_uuid = TgcUuid::from(&[2u8; 16]).unwrap();
+    let mover_id = format!("{mover_uuid:?}");
+    let bonded_id = format!("{bonded_uuid:?}");
+
+    let (command_tx, command_rx) = mpsc::channel();
+    let control = spawn_fake_control_status(
+        test_status_players(vec![
+            bond_player(1, &mover_uuid, Some(&bonded_uuid), 255),
+            bond_player(2, &bonded_uuid, None, 0),
+        ]),
+        Some(command_tx),
+    );
+    let (event_tx, event_rx) = mpsc::sync_channel(32);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut config = QwdConfig::new(format!("ws://127.0.0.1:{port}"), "127.0.0.1", 5413, 8);
+    config.reconnect_delay = Duration::from_secs(60);
+    let _client = QwdClient::spawn(config, control, event_rx);
+
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut socket = accept(stream).unwrap();
+        assert_eq!(read_json(&mut socket)["event"], "node.ready");
+        read_json(&mut socket);
+
+        send_command(
+            &mut socket,
+            json!({
+                "v": 1,
+                "id": 11,
+                "cmd": "move.commit",
+                "data": {
+                    "moveId": "move-bond",
+                    "playerIds": [mover_id.clone()],
+                    "toRoomId": "0d17e2c6-cdbd-40a5-983d-b9deb380dd00",
+                    "udpHost": "127.0.0.1",
+                    "udpPort": 5414
+                }
+            }),
+        );
+        let ack = read_ack(&mut socket, 11);
+        assert_eq!(ack["code"], 4009);
+        assert_eq!(ack["data"]["accepted"], false);
+        let message = ack["message"].as_str().unwrap().to_string();
+        assert!(message.contains(&mover_id), "{message}");
+        assert!(message.contains(&bonded_id), "{message}");
+
+        let result = read_event(&mut socket, "move.result");
+        assert_eq!(result["data"]["moveId"], "move-bond");
+        assert_eq!(result["data"]["accepted"], false);
+        assert_eq!(result["data"]["failedPlayerIds"], json!([mover_id]));
+
+        socket.close(None).ok();
+    });
+    server.join().unwrap();
+    drop(event_tx);
+
+    // Only status queries reached the control plane: the room was never
+    // registered and no MoveGame could be enqueued for the rejected commit.
+    let commands = drain_commands(&command_rx);
+    assert!(
+        commands
+            .iter()
+            .all(|command| matches!(command, ControlCommand::Status)),
+        "{commands:?}"
+    );
+}
+
+#[test]
+fn move_commit_moves_a_bonded_pair_together() {
+    let mover_uuid = TgcUuid::from(&[1u8; 16]).unwrap();
+    let bonded_uuid = TgcUuid::from(&[2u8; 16]).unwrap();
+    let mover_id = format!("{mover_uuid:?}");
+    let bonded_id = format!("{bonded_uuid:?}");
+
+    let (command_tx, command_rx) = mpsc::channel();
+    let control = spawn_fake_control_status(
+        test_status_players(vec![
+            bond_player(1, &mover_uuid, Some(&bonded_uuid), 255),
+            bond_player(2, &bonded_uuid, None, 0),
+        ]),
+        Some(command_tx),
+    );
+    let (event_tx, event_rx) = mpsc::sync_channel(32);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut config = QwdConfig::new(format!("ws://127.0.0.1:{port}"), "127.0.0.1", 5413, 8);
+    config.reconnect_delay = Duration::from_secs(60);
+    let _client = QwdClient::spawn(config, control, event_rx);
+
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut socket = accept(stream).unwrap();
+        assert_eq!(read_json(&mut socket)["event"], "node.ready");
+        read_json(&mut socket);
+
+        send_command(
+            &mut socket,
+            json!({
+                "v": 1,
+                "id": 12,
+                "cmd": "move.commit",
+                "data": {
+                    "moveId": "move-pair",
+                    "playerIds": [mover_id, bonded_id],
+                    "toRoomId": "0d17e2c6-cdbd-40a5-983d-b9deb380dd00",
+                    "udpHost": "127.0.0.1",
+                    "udpPort": 5414
+                }
+            }),
+        );
+        let ack = read_ack(&mut socket, 12);
+        assert_eq!(ack["code"], 0);
+        assert_eq!(ack["data"]["accepted"], true);
+        assert_eq!(ack["data"]["failedPlayerIds"], json!([]));
+
+        socket.close(None).ok();
+    });
+    server.join().unwrap();
+    drop(event_tx);
+
+    // The move was actually enqueued, for both native player ids.
+    let commands = drain_commands(&command_rx);
+    assert!(
+        commands
+            .iter()
+            .any(|command| matches!(command, ControlCommand::UpsertRoom { .. })),
+        "{commands:?}"
+    );
+    let moved = commands
+        .iter()
+        .find_map(|command| match command {
+            ControlCommand::MovePlayersGuarded { player_ids, .. } => Some(player_ids.clone()),
+            _ => None,
+        })
+        .expect("guarded move must be enqueued");
+    let mut moved = moved;
+    moved.sort_unstable();
+    assert_eq!(moved, vec![1, 2]);
+}
+
+#[test]
+fn move_commit_allows_a_solo_move_when_the_bonded_peer_is_already_gone() {
+    let mover_uuid = TgcUuid::from(&[1u8; 16]).unwrap();
+    // The frozen bond points at a uuid that is no longer connected in this
+    // room, so the solo commit must pass.
+    let gone_uuid = TgcUuid::from(&[3u8; 16]).unwrap();
+    let mover_id = format!("{mover_uuid:?}");
+
+    let (command_tx, command_rx) = mpsc::channel();
+    let control = spawn_fake_control_status(
+        test_status_players(vec![bond_player(1, &mover_uuid, Some(&gone_uuid), 255)]),
+        Some(command_tx),
+    );
+    let (event_tx, event_rx) = mpsc::sync_channel(32);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut config = QwdConfig::new(format!("ws://127.0.0.1:{port}"), "127.0.0.1", 5413, 8);
+    config.reconnect_delay = Duration::from_secs(60);
+    let _client = QwdClient::spawn(config, control, event_rx);
+
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut socket = accept(stream).unwrap();
+        assert_eq!(read_json(&mut socket)["event"], "node.ready");
+        read_json(&mut socket);
+
+        send_command(
+            &mut socket,
+            json!({
+                "v": 1,
+                "id": 13,
+                "cmd": "move.commit",
+                "data": {
+                    "moveId": "move-solo",
+                    "playerIds": [mover_id],
+                    "toRoomId": "0d17e2c6-cdbd-40a5-983d-b9deb380dd00",
+                    "udpHost": "127.0.0.1",
+                    "udpPort": 5414
+                }
+            }),
+        );
+        assert_eq!(read_ack(&mut socket, 13)["code"], 0);
+
+        socket.close(None).ok();
+    });
+    server.join().unwrap();
+    drop(event_tx);
+
+    let commands = drain_commands(&command_rx);
+    assert!(
+        commands
+            .iter()
+            .any(|command| matches!(command, ControlCommand::MovePlayersGuarded { .. })),
+        "{commands:?}"
+    );
+}
+
 fn spawn_fake_control(player: Option<PlayerInfo>) -> ControlHandle {
+    spawn_fake_control_status(test_status_players(player.into_iter().collect()), None)
+}
+
+/// Fake control plane answering from a fixed status snapshot. When `log` is
+/// given, every submitted command is forwarded on it so tests can assert which
+/// commands reached the server thread.
+fn spawn_fake_control_status(
+    status: ServerStatus,
+    log: Option<mpsc::Sender<ControlCommand>>,
+) -> ControlHandle {
     let (tx, rx) = control_channel();
     thread::spawn(move || {
         while let Ok(request) = rx.recv() {
+            if let Some(log) = &log {
+                let _ = log.send(request.command.clone());
+            }
             let response = match request.command {
-                ControlCommand::Status => ControlResponse::Status(ServerStatus {
-                    addr: "127.0.0.1:0".to_string(),
-                    peers: 0,
-                    players: usize::from(player.is_some()),
-                    pending_moves: 0,
-                    draining: false,
-                    rooms: Vec::new(),
-                    player_list: player.iter().cloned().collect(),
-                }),
+                ControlCommand::Status => ControlResponse::Status(status.clone()),
                 ControlCommand::MovePlayers { player_ids, .. } => {
                     ControlResponse::Move(MoveOutcome {
                         move_ids: vec![42],
@@ -550,7 +879,8 @@ fn registers_and_answers_qwd_commands() {
         level_id: 0,
         lv_seq: 0,
         moving: false,
-        session_id: Some("s9".into()),
+        session_id: "s9".into(),
+        is_host: false,
         position: None,
         velocity: None,
         state_at: 0,

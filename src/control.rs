@@ -63,6 +63,7 @@ impl RoomEndpoint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpectedPlayerGuard {
     pub player_id: u8,
+    pub uuid: String,
     pub session_id: String,
     pub level_id: u32,
     pub lv_seq: u8,
@@ -142,7 +143,15 @@ pub struct PlayerInfo {
     pub moving: bool,
     /// Server-generated connection identity reported to QWD as `sessionId`.
     /// It is independent of the token supplied in the client's packet header.
-    pub session_id: Option<String>,
+    /// Mandatory: every telemetry entry for a connected peer carries it.
+    pub session_id: String,
+    /// True after disconnect/kick initiation, until the physical ENet disconnect.
+    pub closed: bool,
+    /// Actual per-level authority used by Elect, not a separate room host.
+    /// A mixed-level room can temporarily have multiple authorities.
+    pub is_host: bool,
+    /// Hash from the current level's cached authority upload, if available.
+    pub level_hash: Option<u32>,
     /// Last position decoded from the client's PlayerState header.
     pub position: Option<[f32; 3]>,
     /// Approximate speed in units per second from consecutive positions.
@@ -151,7 +160,8 @@ pub struct PlayerInfo {
     pub state_at: u64,
     /// Unix milliseconds of the last packet received from this client.
     pub last_move_at: u64,
-    /// Affinity weight keyed by the other player's UUID (0.0..=1.0).
+    /// Affinity weight keyed by the other player's UUID (0.0..=1.0), frozen at
+    /// the moment the client sent its Affinity update.
     pub affinity: Vec<(String, f32)>,
 }
 
@@ -218,14 +228,14 @@ pub enum ServerEvent {
         uuid: TgcUuid,
         level_id: u32,
         /// Server-generated connection identity, reported to QWD as `sessionId`.
-        session_id: Option<String>,
+        session_id: String,
         lv_seq: u8,
     },
     PlayerLeft {
         player_id: u8,
         uuid: TgcUuid,
         level_id: u32,
-        session_id: Option<String>,
+        session_id: String,
         lv_seq: u8,
     },
     MoveStarted {

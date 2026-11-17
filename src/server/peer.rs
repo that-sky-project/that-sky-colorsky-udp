@@ -8,7 +8,6 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use enet_sys::ENetPeer;
 
-use crate::protocol::game_msg::affinity::AffinityEntry;
 use crate::protocol::types::TgcUuid;
 use crate::utils::snapshot::{SnapshotReader, SnapshotWriter};
 
@@ -76,6 +75,14 @@ impl LevelDelta {
     }
 }
 
+/// An affinity target frozen at receive time, including its connection identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AffinityBond {
+    pub uuid: TgcUuid,
+    pub session_id: String,
+    pub value: u8,
+}
+
 /// Full state the server maintains for each ENet connection.
 pub struct PeerEntry {
     /// Raw ENet peer pointer, used to send data to this peer.
@@ -94,6 +101,8 @@ pub struct PeerEntry {
     pub state: PeerState,
     /// Instant when the connection was established.
     pub connected_at: Instant,
+    /// Unix milliseconds of the connection's registration (not authority election).
+    pub joined_at: u64,
     /// Connection token bound by the first `JoinGame` packet. Every later
     /// client packet must carry the same token.
     pub conn_magic: Option<u32>,
@@ -101,8 +110,9 @@ pub struct PeerEntry {
     pub control_session_id: String,
     /// Unix milliseconds of the last packet received from this client.
     pub last_seen_at_ms: u64,
-    /// Latest client affinity entries, keyed by net player id.
-    pub affinity: Vec<AffinityEntry>,
+    /// Receive-time UUID + session targets. A snapshot resolves only these exact
+    /// connections; native id or UUID reuse cannot resurrect an obsolete bond.
+    pub affinity: Vec<AffinityBond>,
     /// Player State
     pub player_delta: PlayerState,
     /// Level Data
@@ -129,6 +139,7 @@ impl PeerEntry {
             net_version: [0; 6],
             state: PeerState::Pending,
             connected_at: Instant::now(),
+            joined_at: now_ms(),
             conn_magic: None,
             control_session_id: format!("{:032x}", rand::random::<u128>()),
             last_seen_at_ms: now_ms(),

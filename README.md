@@ -103,10 +103,16 @@ automatically, and reports:
   session
 - `room.telemetry` once per second: a full snapshot first, then deltas with
   `kind`/`baseSeq`/`removedPlayers`; a full resync is sent every 30 frames or
-  30 seconds, and every player is re-sent at least every 2 seconds even when
-  idle. Telemetry carries `capacity`, `load`, and each player's `sessionId`,
-  `lvSeq`, `status`, `position`, `velocity`, `stateAt`, `lastMoveAt` and
-  `affinity` when known. A session change alone produces a delta.
+  10 seconds, and every player is re-sent at least every 2 seconds even when
+  idle. Telemetry carries `capacity`, `load`, and each player's `sessionId`
+  (present on every entry), `lvSeq`, `isHost`, `status`, `position`,
+  `velocity`, `stateAt`, `lastMoveAt` and `affinity` when known. `isHost`
+  marks the active (connected, not moving) player with the earliest join time,
+  ties broken by the lowest player id; it is recomputed on every frame, so a
+  departing host hands over automatically and the handover is published as a
+  delta. `affinity` edges are frozen to the bonded peers' UUIDs at the moment
+  the client sends them, so a later reuse of native player ids can never
+  misattribute a bond. A session change alone produces a delta.
 - `move.result` on failed or timed-out moves
 - `move.completed` once every player in a move group has landed
 - `reservation.expired` when a move hold times out before the group arrives
@@ -124,7 +130,12 @@ with a different payload is rejected as a conflict. `move.commit` validates the
 manager's `expectedParticipants` guard strictly: when present it must match the
 player list one-to-one, and every guard (session, level, generation) is checked
 against the live connection before `MoveGame` is sent. A commit whose delivery
-deadline has expired is rejected.
+deadline has expired is rejected. Before anything is sent, `move.commit` also
+enforces bond completeness: for every moving player, each affinity edge at or
+above 0.9 must either move with the group or point at a peer that is no longer
+connected in the source room; otherwise the commit is rejected with `CONFLICT`
+and a message naming the player and its bonded peer, and no `MoveGame` is
+sent. Bonds are never waived by moving or churn states.
 
 QWD reservations are counted against the eight-player room limit until the
 matching player joins or the reservation TTL expires. A short manager socket
