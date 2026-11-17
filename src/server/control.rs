@@ -154,7 +154,8 @@ impl ServerState {
                         lv_seq: peer.lv_seq,
                         moving: peer.state == PeerState::Moving,
                         session_id: peer.control_session_id.clone(),
-                        is_host: self.level_authority.get(&peer.level_id) == Some(&peer.player_id),
+                        is_host: peer.is_active()
+                            && self.level_authority.get(&peer.level_id) == Some(&peer.player_id),
                         level_hash: self
                             .levels_data
                             .get(&peer.level_id)
@@ -411,14 +412,16 @@ mod tests {
             vec![(format!("{second:?}"), 230.0f32 / 255.0)]
         );
 
-        // Player 2 leaves and a different client takes native id 2. The frozen
-        // bond must still point at the original uuid, not the newcomer's.
+        // The frozen identity remains stored, but a departed connection's edge
+        // is no longer published and can never bind to a recycled native id.
         state.peers.remove(&2);
         state.peers.insert(2, active_peer(2, replacement));
-        let status = state.status();
-        assert_eq!(
-            player_of(&status, &first).affinity,
-            vec![(format!("{second:?}"), 230.0f32 / 255.0)]
+        assert_eq!(state.peers[&1].affinity[0].uuid, second);
+        assert!(player_of(&state.status(), &first).affinity.is_empty());
+        state.peers.insert(2, active_peer(2, second));
+        assert!(
+            player_of(&state.status(), &first).affinity.is_empty(),
+            "even the same UUID cannot inherit a departed session's bond"
         );
     }
 
@@ -450,70 +453,78 @@ mod tests {
     }
 
     #[test]
-    fn host_is_earliest_active_player_and_hands_over_automatically() {
+    fn host_reports_actual_authority_and_follows_handover() {
         let mut state = ServerState::default();
         let first = TgcUuid::from(&[1u8; 16]).unwrap();
         let second = TgcUuid::from(&[2u8; 16]).unwrap();
-        let mut host = active_peer(1, first);
-        host.joined_at = 1_000;
-        let mut joining = active_peer(2, second);
-        joining.joined_at = 2_000;
-        state.peers.insert(1, host);
-        state.peers.insert(2, joining);
-
-        let status = state.status();
-        assert!(player_of(&status, &first).is_host);
-        assert!(!player_of(&status, &second).is_host);
-
-        // A replacement session for the same client is a new peer entry with a
-        // later registration time, so the older player keeps the host role.
-        let mut replacement = active_peer(2, second);
-        replacement.joined_at = 3_000;
-        state.peers.remove(&2);
-        state.peers.insert(2, replacement);
-        let status = state.status();
-        assert!(player_of(&status, &first).is_host);
-        assert!(!player_of(&status, &second).is_host);
-
-        // The host departs: the remaining player takes over on the next
-        // snapshot without any explicit handover step.
-        state.peers.remove(&1);
-        let status = state.status();
-        assert!(player_of(&status, &second).is_host);
+        state.peers.insert(1, active_peer(1, first));
+        state.peers.insert(2, active_peer(2, second));
+        state.level_authority.insert(0, 2);
+        assert!(!player_of(&state.status(), &first).is_host);
+        assert!(player_of(&state.status(), &second).is_host);
+        state.level_authority.insert(0, 1);
+        assert!(player_of(&state.status(), &first).is_host);
+        assert!(!player_of(&state.status(), &second).is_host);
+        state.level_authority.remove(&0);
+        assert!(
+            state
+                .status()
+                .player_list
+                .iter()
+                .all(|player| !player.is_host)
+        );
     }
 
     #[test]
-    fn moving_player_is_never_host() {
+    fn mixed_room_reports_authority_for_each_level() {
         let mut state = ServerState::default();
         let first = TgcUuid::from(&[1u8; 16]).unwrap();
         let second = TgcUuid::from(&[2u8; 16]).unwrap();
-        let mut migrating = active_peer(1, first);
-        migrating.joined_at = 500;
-        migrating.state = PeerState::Moving;
-        let mut staying = active_peer(2, second);
-        staying.joined_at = 600;
-        state.peers.insert(1, migrating);
-        state.peers.insert(2, staying);
-
-        let status = state.status();
-        assert!(!player_of(&status, &first).is_host);
-        assert!(player_of(&status, &second).is_host);
+        let mut a = active_peer(1, first);
+        let mut b = active_peer(2, second);
+        a.level_id = 7;
+        b.level_id = 8;
+        state.peers.insert(1, a);
+        state.peers.insert(2, b);
+        state.level_authority.insert(7, 1);
+        state.level_authority.insert(8, 2);
+        assert!(
+            state
+                .status()
+                .player_list
+                .iter()
+                .all(|player| player.is_host)
+        );
+        state.peers.get_mut(&1).unwrap().state = PeerState::Moving;
+        assert!(!player_of(&state.status(), &first).is_host);
     }
 
     #[test]
-    fn host_tie_breaks_to_lowest_player_id() {
+    fn final_guard_rejects_reverse_bond_before_any_packets() {
         let mut state = ServerState::default();
-        let fifth = TgcUuid::from(&[5u8; 16]).unwrap();
-        let third = TgcUuid::from(&[3u8; 16]).unwrap();
-        let mut a = active_peer(5, fifth);
-        a.joined_at = 700;
-        let mut b = active_peer(3, third);
-        b.joined_at = 700;
-        state.peers.insert(5, a);
-        state.peers.insert(3, b);
-
-        let status = state.status();
-        assert!(player_of(&status, &third).is_host);
-        assert!(!player_of(&status, &fifth).is_host);
+        let first = TgcUuid::from(&[1u8; 16]).unwrap();
+        let second = TgcUuid::from(&[2u8; 16]).unwrap();
+        state.peers.insert(1, active_peer(1, first));
+        state.peers.insert(2, active_peer(2, second));
+        state.handle_affinity(2, affinity_msg(&[(1, 255)])).unwrap();
+        let peer = &state.peers[&1];
+        let expected = crate::control::ExpectedPlayerGuard {
+            player_id: 1,
+            uuid: format!("{first:?}"),
+            session_id: peer.control_session_id.clone(),
+            level_id: 0,
+            lv_seq: 0,
+        };
+        let response = state.handle_control(ControlCommand::MovePlayersGuarded {
+            player_ids: vec![1],
+            room_id: "target".into(),
+            expected: vec![expected],
+            deadline_ms: None,
+        });
+        assert!(
+            matches!(response, ControlResponse::Error { message } if message.contains("hard-bonded"))
+        );
+        assert!(state.pending_moves.is_empty());
+        assert!(state.peers.values().all(|peer| peer.is_active()));
     }
 }

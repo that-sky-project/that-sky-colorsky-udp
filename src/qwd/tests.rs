@@ -548,6 +548,9 @@ fn move_commit_rejects_a_connected_bonded_peer_left_outside_the_group() {
                 }
             }),
         );
+        // Rejection emits move.result before the command ACK. Consume both
+        // without letting the generic ACK reader discard the result forever.
+        let result = read_event(&mut socket, "move.result");
         let ack = read_ack(&mut socket, 11);
         assert_eq!(ack["code"], 4009);
         assert_eq!(ack["data"]["accepted"], false);
@@ -555,7 +558,6 @@ fn move_commit_rejects_a_connected_bonded_peer_left_outside_the_group() {
         assert!(message.contains(&mover_id), "{message}");
         assert!(message.contains(&bonded_id), "{message}");
 
-        let result = read_event(&mut socket, "move.result");
         assert_eq!(result["data"]["moveId"], "move-bond");
         assert_eq!(result["data"]["accepted"], false);
         assert_eq!(result["data"]["failedPlayerIds"], json!([mover_id]));
