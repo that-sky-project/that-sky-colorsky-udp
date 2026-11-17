@@ -66,8 +66,7 @@ impl ServerState {
                         );
                     }
                 }
-                let selected: std::collections::HashSet<u8> =
-                    player_ids.iter().copied().collect();
+                let selected: std::collections::HashSet<u8> = player_ids.iter().copied().collect();
                 for peer in self.peers.values().filter(|peer| peer.is_player()) {
                     let peer_selected = selected.contains(&peer.player_id);
                     for bond in &peer.affinity {
