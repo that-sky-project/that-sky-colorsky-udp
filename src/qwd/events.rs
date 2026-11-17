@@ -261,7 +261,7 @@ fn same_telemetry(a: &Value, b: &Value) -> bool {
 
 /// Shape one player's QWD telemetry entry. Optional fields mirror XYSKY, which
 /// omits them when the corresponding data is unavailable.
-fn player_telemetry(player: &PlayerInfo, status_fields: bool) -> Value {
+fn player_telemetry(player: &PlayerInfo, _status_fields: bool) -> Value {
     let mut value = json!({
         "playerId": player.uuid,
         "levelId": player.level_id,
@@ -275,9 +275,7 @@ fn player_telemetry(player: &PlayerInfo, status_fields: bool) -> Value {
     if let Some(level_hash) = player.level_hash {
         value["levelHash"] = json!(level_hash);
     }
-    if status_fields {
-        value["status"] = json!(player_status(player.moving));
-    }
+    value["status"] = json!(player_status(player.moving));
     if player.state_at > 0 {
         value["stateAt"] = json!(player.state_at);
     }
@@ -360,6 +358,7 @@ mod tests {
             assert_eq!(value["sessionId"], json!("session-1"));
             assert_eq!(value["lvSeq"], json!(0));
             assert_eq!(value["isHost"], json!(false));
+            assert_eq!(value["status"], json!("ACTIVE"));
         }
     }
 

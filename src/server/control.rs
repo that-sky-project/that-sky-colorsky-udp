@@ -66,6 +66,15 @@ impl ServerState {
                         );
                     }
                 }
+                let levels: std::collections::HashSet<u32> = self
+                    .peers
+                    .values()
+                    .filter(|peer| peer.is_active() && player_ids.contains(&peer.player_id))
+                    .map(|peer| peer.level_id)
+                    .collect();
+                if levels.len() > 1 {
+                    return ControlResponse::error("guarded move group spans different levels");
+                }
                 let selected: std::collections::HashSet<u8> = player_ids.iter().copied().collect();
                 for peer in self.peers.values().filter(|peer| peer.is_player()) {
                     let peer_selected = selected.contains(&peer.player_id);
