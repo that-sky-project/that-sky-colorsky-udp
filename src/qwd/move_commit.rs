@@ -257,14 +257,19 @@ impl QwdClient {
             return Ok((INTERNAL, Some(message), None));
         }
 
-        let execution_guards = guards
+        // Even a redirect without manager-supplied guards is fenced to the
+        // exact status snapshot used above; native ids may be reused before
+        // this command reaches the ENet thread.
+        let execution_guards = status
+            .player_list
             .iter()
-            .map(|guard| crate::control::ExpectedPlayerGuard {
-                player_id: uuid_to_net[&guard.player_id],
-                uuid: guard.player_id.clone(),
-                session_id: guard.session_id.clone(),
-                level_id: guard.level_id,
-                lv_seq: guard.lv_seq,
+            .filter(|player| player_ids.contains(&player.uuid))
+            .map(|player| crate::control::ExpectedPlayerGuard {
+                player_id: player.player_id,
+                uuid: player.uuid.clone(),
+                session_id: player.session_id.clone(),
+                level_id: player.level_id,
+                lv_seq: player.lv_seq,
             })
             .collect();
         match self.control.move_players_guarded(
