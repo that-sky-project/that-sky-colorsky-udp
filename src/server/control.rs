@@ -20,6 +20,84 @@ impl ServerState {
                 player_ids,
                 room_id,
             } => self.move_players(player_ids, &room_id),
+            ControlCommand::MovePlayersGuarded {
+                player_ids,
+                room_id,
+                expected,
+                deadline_ms,
+            } => {
+                if deadline_ms.is_some_and(|deadline| deadline <= super::peer::now_ms()) {
+                    return ControlResponse::error("move delivery deadline expired");
+                }
+                if player_ids.is_empty()
+                    || player_ids.len() > 7
+                    || player_ids
+                        .iter()
+                        .collect::<std::collections::HashSet<_>>()
+                        .len()
+                        != player_ids.len()
+                {
+                    return ControlResponse::error("invalid guarded move group");
+                }
+                if !expected.is_empty()
+                    && (expected.len() != player_ids.len()
+                        || expected
+                            .iter()
+                            .map(|guard| guard.player_id)
+                            .collect::<std::collections::HashSet<_>>()
+                            .len()
+                            != player_ids.len())
+                {
+                    return ControlResponse::error("incomplete source participant guards");
+                }
+                for guard in &expected {
+                    if !player_ids.contains(&guard.player_id)
+                        || !self.peers.values().any(|peer| {
+                            peer.is_active()
+                                && peer.player_id == guard.player_id
+                                && format!("{:?}", peer.uuid) == guard.uuid
+                                && peer.control_session_id == guard.session_id
+                                && peer.level_id == guard.level_id
+                                && peer.lv_seq == guard.lv_seq
+                        })
+                    {
+                        return ControlResponse::error(
+                            "source participant changed during move preparation",
+                        );
+                    }
+                }
+                let levels: std::collections::HashSet<u32> = self
+                    .peers
+                    .values()
+                    .filter(|peer| peer.is_active() && player_ids.contains(&peer.player_id))
+                    .map(|peer| peer.level_id)
+                    .collect();
+                if levels.len() > 1 {
+                    return ControlResponse::error("guarded move group spans different levels");
+                }
+                let selected: std::collections::HashSet<u8> = player_ids.iter().copied().collect();
+                for peer in self.peers.values().filter(|peer| peer.is_player()) {
+                    let peer_selected = selected.contains(&peer.player_id);
+                    for bond in &peer.affinity {
+                        if bond.value < 230 {
+                            continue;
+                        }
+                        let Some(target) = self.peers.values().find(|target| {
+                            target.is_player()
+                                && target.uuid == bond.uuid
+                                && target.control_session_id == bond.session_id
+                        }) else {
+                            continue;
+                        };
+                        if peer_selected != selected.contains(&target.player_id) {
+                            return ControlResponse::error(
+                                "hard-bonded peer is outside the guarded move group",
+                            );
+                        }
+                    }
+                }
+                self.move_players(player_ids, &room_id)
+            }
             ControlCommand::MoveLevel { level_id, room_id } => self.move_level(level_id, &room_id),
             ControlCommand::CancelMove { player_id, reason } => {
                 self.cancel_player_move(player_id, reason)
@@ -69,16 +147,14 @@ impl ServerState {
                     let affinity: Vec<(String, f32)> = peer
                         .affinity
                         .iter()
-                        .filter_map(|entry| {
-                            self.peers
-                                .values()
-                                .find(|other| {
-                                    other.player_id == entry.net_player_id && other.is_player()
-                                })
-                                .map(|other| {
-                                    (format!("{:?}", other.uuid), f32::from(entry.value) / 255.0)
-                                })
+                        .filter(|bond| {
+                            self.peers.values().any(|target| {
+                                target.is_player()
+                                    && target.uuid == bond.uuid
+                                    && target.control_session_id == bond.session_id
+                            })
                         })
+                        .map(|bond| (format!("{:?}", bond.uuid), f32::from(bond.value) / 255.0))
                         .collect();
                     PlayerInfo {
                         player_id: peer.player_id,
@@ -86,7 +162,13 @@ impl ServerState {
                         level_id: peer.level_id,
                         lv_seq: peer.lv_seq,
                         moving: peer.state == PeerState::Moving,
-                        session_id: peer.conn_magic,
+                        session_id: peer.control_session_id.clone(),
+                        is_host: peer.is_active()
+                            && self.level_authority.get(&peer.level_id) == Some(&peer.player_id),
+                        level_hash: self
+                            .levels_data
+                            .get(&peer.level_id)
+                            .map(|level| level.header.level_hash),
                         position: peer.player_delta.position,
                         velocity: peer.player_delta.velocity,
                         state_at: peer.player_delta.state_at_ms,
@@ -99,7 +181,7 @@ impl ServerState {
     }
 
     fn control_kick_player(&mut self, player_id: u8, reason: &str) -> ControlResponse {
-        let Some((uuid, level_id)) = self
+        let Some((uuid, level_id, session_id, lv_seq)) = self
             .peers
             .values_mut()
             .find(|peer| peer.player_id == player_id && peer.is_player())
@@ -112,7 +194,12 @@ impl ServerState {
                 peer.send(0, &wire, true);
                 peer.state = PeerState::Closed;
                 peer.disconnect_later(0);
-                (peer.uuid, peer.level_id)
+                (
+                    peer.uuid,
+                    peer.level_id,
+                    peer.control_session_id.clone(),
+                    peer.lv_seq,
+                )
             })
         else {
             return ControlResponse::error(format!("player not found: {player_id}"));
@@ -122,6 +209,8 @@ impl ServerState {
             player_id,
             uuid,
             level_id,
+            session_id,
+            lv_seq,
         });
 
         ControlResponse::Ok
@@ -170,9 +259,39 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use crate::control::RoomEndpoint;
+    use crate::protocol::game_msg::{GameMsg, GameMsgId};
     use crate::protocol::net_address::NetAddress;
+    use crate::protocol::types::TgcUuid;
 
     use super::*;
+
+    fn active_peer(player_id: u8, uuid: TgcUuid) -> crate::server::peer::PeerEntry {
+        let mut peer = crate::server::peer::PeerEntry::new(std::ptr::null_mut());
+        peer.player_id = player_id;
+        peer.uuid = uuid;
+        peer.state = PeerState::Active;
+        peer
+    }
+
+    /// Build a client `Affinity` payload: a compressed count (four bits, one
+    /// byte for up to eight entries) followed by `(net_player_id, value)`.
+    fn affinity_msg(entries: &[(u8, u8)]) -> GameMsg {
+        let mut payload = vec![entries.len() as u8];
+        for (net_player_id, value) in entries {
+            payload.push(*net_player_id);
+            payload.push(*value);
+        }
+        GameMsg::new(GameMsgId::Affinity, 0, 0, &payload)
+    }
+
+    fn player_of<'a>(status: &'a ServerStatus, uuid: &TgcUuid) -> &'a PlayerInfo {
+        let text = format!("{uuid:?}");
+        status
+            .player_list
+            .iter()
+            .find(|player| player.uuid == text)
+            .unwrap()
+    }
 
     #[test]
     fn status_lists_registered_rooms() {
@@ -202,6 +321,76 @@ mod tests {
     }
 
     #[test]
+    fn status_uses_server_connection_identity_instead_of_client_token() {
+        let mut state = ServerState::default();
+        let mut peer = crate::server::peer::PeerEntry::new(std::ptr::null_mut());
+        peer.player_id = 1;
+        peer.state = PeerState::Active;
+        peer.conn_magic = Some(7);
+        let identity = peer.control_session_id.clone();
+        state.peers.insert(1, peer);
+        let status = state.status();
+        assert_eq!(status.player_list[0].session_id, identity);
+        assert_ne!(identity, "7");
+    }
+
+    #[test]
+    fn guarded_execution_refuses_replacement_session_generation_and_expired_delivery() {
+        let mut state = ServerState::default();
+        let mut peer = crate::server::peer::PeerEntry::new(std::ptr::null_mut());
+        peer.player_id = 1;
+        peer.state = PeerState::Active;
+        peer.level_id = 7;
+        peer.lv_seq = 2;
+        let session_id = peer.control_session_id.clone();
+        state.peers.insert(1, peer);
+        for expected in [
+            crate::control::ExpectedPlayerGuard {
+                player_id: 1,
+                uuid: format!("{:?}", state.peers[&1].uuid),
+                session_id: "old".into(),
+                level_id: 7,
+                lv_seq: 2,
+            },
+            crate::control::ExpectedPlayerGuard {
+                player_id: 1,
+                uuid: format!("{:?}", state.peers[&1].uuid),
+                session_id: session_id.clone(),
+                level_id: 6,
+                lv_seq: 2,
+            },
+            crate::control::ExpectedPlayerGuard {
+                player_id: 1,
+                uuid: format!("{:?}", state.peers[&1].uuid),
+                session_id: session_id.clone(),
+                level_id: 7,
+                lv_seq: 1,
+            },
+        ] {
+            let response = state.handle_control(ControlCommand::MovePlayersGuarded {
+                player_ids: vec![1],
+                room_id: "target".into(),
+                expected: vec![expected],
+                deadline_ms: None,
+            });
+            assert!(
+                matches!(response, ControlResponse::Error { message } if message.contains("participant changed"))
+            );
+        }
+        let response = state.handle_control(ControlCommand::MovePlayersGuarded {
+            player_ids: vec![1],
+            room_id: "target".into(),
+            expected: vec![],
+            deadline_ms: Some(1),
+        });
+        assert!(
+            matches!(response, ControlResponse::Error { message } if message.contains("deadline expired"))
+        );
+        assert_eq!(state.pending_moves.len(), 0);
+        assert!(state.peers[&1].is_active());
+    }
+
+    #[test]
     fn move_with_unknown_room_is_rejected() {
         let mut state = ServerState::default();
         let response = state.handle_control(ControlCommand::MovePlayer {
@@ -210,5 +399,141 @@ mod tests {
         });
 
         assert!(!response.is_ok());
+    }
+
+    #[test]
+    fn affinity_freezes_bonded_uuid_and_survives_net_id_reuse() {
+        let mut state = ServerState::default();
+        let first = TgcUuid::from(&[1u8; 16]).unwrap();
+        let second = TgcUuid::from(&[2u8; 16]).unwrap();
+        let replacement = TgcUuid::from(&[3u8; 16]).unwrap();
+        state.peers.insert(1, active_peer(1, first));
+        state.peers.insert(2, active_peer(2, second));
+
+        assert!(
+            state
+                .handle_affinity(1, affinity_msg(&[(2, 230)]))
+                .is_some()
+        );
+        let status = state.status();
+        assert_eq!(
+            player_of(&status, &first).affinity,
+            vec![(format!("{second:?}"), 230.0f32 / 255.0)]
+        );
+
+        // The frozen identity remains stored, but a departed connection's edge
+        // is no longer published and can never bind to a recycled native id.
+        state.peers.remove(&2);
+        state.peers.insert(2, active_peer(2, replacement));
+        assert_eq!(state.peers[&1].affinity[0].uuid, second);
+        assert!(player_of(&state.status(), &first).affinity.is_empty());
+        state.peers.insert(2, active_peer(2, second));
+        assert!(
+            player_of(&state.status(), &first).affinity.is_empty(),
+            "even the same UUID cannot inherit a departed session's bond"
+        );
+    }
+
+    #[test]
+    fn affinity_entries_without_a_connected_peer_are_not_frozen() {
+        let mut state = ServerState::default();
+        let first = TgcUuid::from(&[1u8; 16]).unwrap();
+        state.peers.insert(1, active_peer(1, first));
+
+        // Native id 5 belongs to nobody; deferring the entry would let a later
+        // id reuse misattribute the bond, so it is dropped instead.
+        assert!(
+            state
+                .handle_affinity(1, affinity_msg(&[(5, 255)]))
+                .is_some()
+        );
+        let status = state.status();
+        assert!(player_of(&status, &first).affinity.is_empty());
+
+        // A second update replaces the whole frozen set.
+        let second = TgcUuid::from(&[2u8; 16]).unwrap();
+        state.peers.insert(2, active_peer(2, second));
+        assert!(state.handle_affinity(1, affinity_msg(&[(2, 10)])).is_some());
+        let status = state.status();
+        assert_eq!(
+            player_of(&status, &first).affinity,
+            vec![(format!("{second:?}"), 10.0f32 / 255.0)]
+        );
+    }
+
+    #[test]
+    fn host_reports_actual_authority_and_follows_handover() {
+        let mut state = ServerState::default();
+        let first = TgcUuid::from(&[1u8; 16]).unwrap();
+        let second = TgcUuid::from(&[2u8; 16]).unwrap();
+        state.peers.insert(1, active_peer(1, first));
+        state.peers.insert(2, active_peer(2, second));
+        state.level_authority.insert(0, 2);
+        assert!(!player_of(&state.status(), &first).is_host);
+        assert!(player_of(&state.status(), &second).is_host);
+        state.level_authority.insert(0, 1);
+        assert!(player_of(&state.status(), &first).is_host);
+        assert!(!player_of(&state.status(), &second).is_host);
+        state.level_authority.remove(&0);
+        assert!(
+            state
+                .status()
+                .player_list
+                .iter()
+                .all(|player| !player.is_host)
+        );
+    }
+
+    #[test]
+    fn mixed_room_reports_authority_for_each_level() {
+        let mut state = ServerState::default();
+        let first = TgcUuid::from(&[1u8; 16]).unwrap();
+        let second = TgcUuid::from(&[2u8; 16]).unwrap();
+        let mut a = active_peer(1, first);
+        let mut b = active_peer(2, second);
+        a.level_id = 7;
+        b.level_id = 8;
+        state.peers.insert(1, a);
+        state.peers.insert(2, b);
+        state.level_authority.insert(7, 1);
+        state.level_authority.insert(8, 2);
+        assert!(
+            state
+                .status()
+                .player_list
+                .iter()
+                .all(|player| player.is_host)
+        );
+        state.peers.get_mut(&1).unwrap().state = PeerState::Moving;
+        assert!(!player_of(&state.status(), &first).is_host);
+    }
+
+    #[test]
+    fn final_guard_rejects_reverse_bond_before_any_packets() {
+        let mut state = ServerState::default();
+        let first = TgcUuid::from(&[1u8; 16]).unwrap();
+        let second = TgcUuid::from(&[2u8; 16]).unwrap();
+        state.peers.insert(1, active_peer(1, first));
+        state.peers.insert(2, active_peer(2, second));
+        state.handle_affinity(2, affinity_msg(&[(1, 255)])).unwrap();
+        let peer = &state.peers[&1];
+        let expected = crate::control::ExpectedPlayerGuard {
+            player_id: 1,
+            uuid: format!("{first:?}"),
+            session_id: peer.control_session_id.clone(),
+            level_id: 0,
+            lv_seq: 0,
+        };
+        let response = state.handle_control(ControlCommand::MovePlayersGuarded {
+            player_ids: vec![1],
+            room_id: "target".into(),
+            expected: vec![expected],
+            deadline_ms: None,
+        });
+        assert!(
+            matches!(response, ControlResponse::Error { message } if message.contains("hard-bonded"))
+        );
+        assert!(state.pending_moves.is_empty());
+        assert!(state.peers.values().all(|peer| peer.is_active()));
     }
 }

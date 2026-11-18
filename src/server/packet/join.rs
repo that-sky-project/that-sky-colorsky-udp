@@ -115,12 +115,13 @@ impl ServerState {
             self.complete_migration_roster(&key);
         }
 
-        let session_id = self.peers.get(&peer_key).and_then(|peer| peer.conn_magic);
+        let session_id = self.peers.get(&peer_key)?.control_session_id.clone();
         self.emit_event(ServerEvent::PlayerJoined {
             player_id,
             uuid: join.uuid,
             level_id: join.level_id,
             session_id,
+            lv_seq: join.level_change_count,
         });
 
         tracing::info!(

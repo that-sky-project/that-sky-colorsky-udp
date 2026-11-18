@@ -32,6 +32,7 @@ impl QwdClient {
             return Ok(());
         }
 
+        let fingerprint = super::command_cache::fingerprint(&value);
         let command: ManagerCommand = match serde_json::from_value(value) {
             Ok(command) => command,
             Err(error) => {
@@ -49,7 +50,7 @@ impl QwdClient {
             return Ok(());
         }
 
-        if command.v == 0 {
+        if command.v != 1 {
             let value = ack(
                 command.id,
                 BAD_REQUEST,
@@ -59,6 +60,23 @@ impl QwdClient {
             return self.send_json(socket, &value);
         }
 
+        match self.command_cache.get(command.id, &fingerprint) {
+            super::command_cache::Lookup::Replay(response) => {
+                return self.send_json(socket, &response);
+            }
+            super::command_cache::Lookup::Collision => {
+                return self.send_json(
+                    socket,
+                    &ack(
+                        command.id,
+                        CONFLICT,
+                        Some("command id reused with different payload"),
+                        None,
+                    ),
+                );
+            }
+            super::command_cache::Lookup::Miss => {}
+        }
         tracing::debug!(id = command.id, cmd = %command.cmd, "[QWD] command");
 
         let result = match command.cmd.as_str() {
@@ -82,6 +100,8 @@ impl QwdClient {
         };
 
         let value = ack(command.id, code, message.as_deref(), data);
+        self.command_cache
+            .finish(command.id, fingerprint, value.clone());
         tracing::debug!(
             id = command.id,
             cmd = %command.cmd,
@@ -100,6 +120,8 @@ impl QwdClient {
             .pointer("/data/message")
             .and_then(Value::as_str)
             .unwrap_or("");
+        self.force_full = true;
+        self.telemetry_roster = None;
         let disabled = self.caps.observe_rejection(message);
         if !disabled.is_empty() {
             tracing::warn!(
@@ -112,13 +134,12 @@ impl QwdClient {
         if self.last_manager_error.as_deref() != Some(signature.as_str()) {
             tracing::warn!(
                 code = ?code,
-                message,
-                raw = %text,
+                message_bytes = message.len(),
                 "[QWD] manager rejected a message"
             );
             self.last_manager_error = Some(signature);
         } else {
-            tracing::debug!(code = ?code, message, "[QWD] manager error (repeated)");
+            tracing::debug!(code = ?code, "[QWD] manager error (repeated)");
         }
     }
 
@@ -170,6 +191,10 @@ impl QwdClient {
             return Ok((BAD_REQUEST, Some("playerId is required".to_string()), None));
         };
         let presented_token = command.string_field("reservationToken");
+        let ttl = match command.ttl() {
+            Ok(ttl) => ttl,
+            Err(message) => return Ok((BAD_REQUEST, Some(message), None)),
+        };
 
         let status = self.status()?;
 
@@ -178,7 +203,7 @@ impl QwdClient {
         // `acknowledge()` requires the lease in every positive ack. Renewing an
         // existing hold must come from its owner.
         let now = Instant::now();
-        let expires_at = now_ms() + command.ttl().as_millis() as u64;
+        let expires_at = now_ms() + ttl.as_millis() as u64;
         if let Some(existing) = self.reservations.player_token_of(player_id, now) {
             if !matches_token(Some(existing), presented_token) {
                 return Ok((
@@ -187,9 +212,7 @@ impl QwdClient {
                     None,
                 ));
             }
-            let token = self
-                .reservations
-                .reserve_player(player_id, command.ttl(), now);
+            let token = self.reservations.reserve_player(player_id, ttl, now);
             let facts = self.facts_for(&status);
             return Ok((
                 OK,
@@ -228,9 +251,7 @@ impl QwdClient {
             ));
         }
 
-        let token = self
-            .reservations
-            .reserve_player(player_id, command.ttl(), now);
+        let token = self.reservations.reserve_player(player_id, ttl, now);
 
         tracing::debug!(room_id = %room_id, player_id = %player_id, "[QWD] room.reserve");
 
@@ -276,7 +297,10 @@ impl QwdClient {
         let Some(move_id) = command.move_id() else {
             return Ok((BAD_REQUEST, Some("moveId is required".to_string()), None));
         };
-        let player_ids = command.player_ids();
+        let player_ids = match command.player_ids() {
+            Ok(player_ids) => player_ids,
+            Err(message) => return Ok((BAD_REQUEST, Some(message), None)),
+        };
         if player_ids.is_empty() || player_ids.len() > 7 {
             return Ok((
                 BAD_REQUEST,
@@ -285,6 +309,10 @@ impl QwdClient {
             ));
         }
         let presented_token = command.string_field("reservationToken");
+        let ttl = match command.ttl() {
+            Ok(ttl) => ttl,
+            Err(message) => return Ok((BAD_REQUEST, Some(message), None)),
+        };
 
         let status = self.status()?;
         let now = Instant::now();
@@ -329,30 +357,28 @@ impl QwdClient {
             ));
         }
 
-        let token = match self.reservations.reserve_move(
-            move_id,
-            &player_ids,
-            command.ttl(),
-            now,
-            presented_token,
-        ) {
-            Ok(token) => token,
-            Err(ReserveMoveError::ForeignToken) => {
-                return Ok((
-                    CONFLICT,
-                    Some("reservation owner conflicts".to_string()),
-                    None,
-                ));
-            }
-            Err(ReserveMoveError::Conflict) => {
-                return Ok((
-                    CONFLICT,
-                    Some("move reservation conflicts".to_string()),
-                    None,
-                ));
-            }
-        };
-        let expires_at = now_ms() + command.ttl().as_millis() as u64;
+        let token =
+            match self
+                .reservations
+                .reserve_move(move_id, &player_ids, ttl, now, presented_token)
+            {
+                Ok(token) => token,
+                Err(ReserveMoveError::ForeignToken) => {
+                    return Ok((
+                        CONFLICT,
+                        Some("reservation owner conflicts".to_string()),
+                        None,
+                    ));
+                }
+                Err(ReserveMoveError::Conflict) => {
+                    return Ok((
+                        CONFLICT,
+                        Some("move reservation conflicts".to_string()),
+                        None,
+                    ));
+                }
+            };
+        let expires_at = now_ms() + ttl.as_millis() as u64;
 
         tracing::debug!(
             move_id = %move_id,

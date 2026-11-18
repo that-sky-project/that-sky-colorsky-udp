@@ -96,7 +96,7 @@ pub enum GameMsgId {
     /// We need to package data from other players.
     ///
     /// #### C -> S
-    /// ```
+    /// ```text
     /// [player_state]
     /// ```
     ///

@@ -96,32 +96,9 @@ impl ManagerCaps {
                         self.occupancy_facts = false;
                         disabled.push("occupancy facts");
                     }
-                    if self.settle_extras
-                        && keys.iter().any(|key| {
-                            matches!(
-                                *key,
-                                "phase" | "reservationToken" | "admittedPlayerIds" | "expiresAt"
-                            )
-                        })
-                    {
-                        self.settle_extras = false;
-                        disabled.push("settle event extras");
-                    }
-                    let in_players =
-                        issue
-                            .get("path")
-                            .and_then(Value::as_array)
-                            .is_some_and(|path| {
-                                path.iter()
-                                    .any(|segment| segment.as_str() == Some("players"))
-                            });
-                    if self.player_status_fields
-                        && in_players
-                        && keys.iter().any(|key| matches!(*key, "lvSeq" | "status"))
-                    {
-                        self.player_status_fields = false;
-                        disabled.push("player status fields");
-                    }
+                    // Generation, status and reservation identity are safety
+                    // fields. An incompatible manager must reject explicitly;
+                    // never strip these fields just to silence its validator.
                 }
                 _ => {}
             }
@@ -208,7 +185,7 @@ mod tests {
     }
 
     #[test]
-    fn player_field_rejection_disables_status_fields() {
+    fn player_field_rejection_preserves_generation_and_status() {
         let mut caps = ManagerCaps::default();
         let rejection = r#"[
           {
@@ -218,16 +195,13 @@ mod tests {
             "message": "Unrecognized key(s) in object"
           }
         ]"#;
-        assert_eq!(
-            caps.observe_rejection(rejection),
-            vec!["player status fields"]
-        );
-        assert!(!caps.player_status_fields);
+        assert!(caps.observe_rejection(rejection).is_empty());
+        assert!(caps.player_status_fields);
         assert!(caps.occupancy_facts);
     }
 
     #[test]
-    fn settle_field_rejection_disables_extras() {
+    fn settle_field_rejection_preserves_reservation_identity() {
         let mut caps = ManagerCaps::default();
         let rejection = r#"[
           {
@@ -237,11 +211,8 @@ mod tests {
             "message": "Unrecognized key(s) in object"
           }
         ]"#;
-        assert_eq!(
-            caps.observe_rejection(rejection),
-            vec!["settle event extras"]
-        );
-        assert!(!caps.settle_extras);
+        assert!(caps.observe_rejection(rejection).is_empty());
+        assert!(caps.settle_extras);
         assert!(caps.move_completed);
     }
 

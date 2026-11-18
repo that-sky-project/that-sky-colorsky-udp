@@ -59,6 +59,16 @@ impl RoomEndpoint {
     }
 }
 
+/// Source facts captured by the manager, checked again on the ENet thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedPlayerGuard {
+    pub player_id: u8,
+    pub uuid: String,
+    pub session_id: String,
+    pub level_id: u32,
+    pub lv_seq: u8,
+}
+
 /// Commands accepted by the server thread.
 #[derive(Debug, Clone)]
 pub enum ControlCommand {
@@ -68,6 +78,13 @@ pub enum ControlCommand {
     MovePlayers {
         player_ids: Vec<u8>,
         room_id: String,
+    },
+    /// Revalidate source identity/generation and deadline at actual execution.
+    MovePlayersGuarded {
+        player_ids: Vec<u8>,
+        room_id: String,
+        expected: Vec<ExpectedPlayerGuard>,
+        deadline_ms: Option<u64>,
     },
     /// Move every active player in a level to a registered room.
     MoveLevel { level_id: u32, room_id: String },
@@ -124,10 +141,15 @@ pub struct PlayerInfo {
     pub lv_seq: u8,
     /// Whether the client is mid-migration (MoveGame sent, result pending).
     pub moving: bool,
-    /// Per-connection token reported to QWD as `sessionId`. Without it the
-    /// manager cannot tell a reconnected client from the old session, and its
-    /// lvSeq wrap check rejects every telemetry frame of a moved-in player.
-    pub session_id: Option<u32>,
+    /// Server-generated connection identity reported to QWD as `sessionId`.
+    /// It is independent of the token supplied in the client's packet header.
+    /// Mandatory: every telemetry entry for a connected peer carries it.
+    pub session_id: String,
+    /// Actual per-level authority used by Elect, not a separate room host.
+    /// A mixed-level room can temporarily have multiple authorities.
+    pub is_host: bool,
+    /// Hash from the current level's cached authority upload, if available.
+    pub level_hash: Option<u32>,
     /// Last position decoded from the client's PlayerState header.
     pub position: Option<[f32; 3]>,
     /// Approximate speed in units per second from consecutive positions.
@@ -136,7 +158,8 @@ pub struct PlayerInfo {
     pub state_at: u64,
     /// Unix milliseconds of the last packet received from this client.
     pub last_move_at: u64,
-    /// Affinity weight keyed by the other player's UUID (0.0..=1.0).
+    /// Affinity weight keyed by the other player's UUID (0.0..=1.0), frozen at
+    /// the moment the client sent its Affinity update.
     pub affinity: Vec<(String, f32)>,
 }
 
@@ -202,13 +225,16 @@ pub enum ServerEvent {
         player_id: u8,
         uuid: TgcUuid,
         level_id: u32,
-        /// Per-connection token, reported to QWD as `sessionId`.
-        session_id: Option<u32>,
+        /// Server-generated connection identity, reported to QWD as `sessionId`.
+        session_id: String,
+        lv_seq: u8,
     },
     PlayerLeft {
         player_id: u8,
         uuid: TgcUuid,
         level_id: u32,
+        session_id: String,
+        lv_seq: u8,
     },
     MoveStarted {
         move_id: u64,
@@ -302,6 +328,22 @@ impl ControlHandle {
         self.request(ControlCommand::MovePlayers {
             player_ids,
             room_id: room_id.into(),
+        })
+    }
+
+    /// Move after checking the manager's source snapshot on the server thread.
+    pub fn move_players_guarded(
+        &self,
+        player_ids: Vec<u8>,
+        room_id: String,
+        expected: Vec<ExpectedPlayerGuard>,
+        deadline_ms: Option<u64>,
+    ) -> Result<ControlResponse, ControlError> {
+        self.request(ControlCommand::MovePlayersGuarded {
+            player_ids,
+            room_id,
+            expected,
+            deadline_ms,
         })
     }
 

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
 
-use crate::control::PlayerInfo;
+use crate::control::{PlayerInfo, ServerStatus};
 
 use super::facts::player_status;
 use super::protocol::event;
@@ -90,6 +90,16 @@ impl QwdClient {
 
     pub(super) fn send_telemetry(&mut self, socket: &mut Socket) -> Result<(), String> {
         let status = self.status()?;
+        self.publish_telemetry(&status, |client, value| client.send_json(socket, value))
+    }
+
+    /// Build against the committed baseline, send, then atomically advance all
+    /// wire-visible bookkeeping. A failed send leaves the next attempt intact.
+    pub(super) fn publish_telemetry(
+        &mut self,
+        status: &ServerStatus,
+        send: impl FnOnce(&Self, &Value) -> Result<(), String>,
+    ) -> Result<(), String> {
         let capacity = self.config.capacity;
         let load = if capacity == 0 {
             0.0
@@ -97,7 +107,7 @@ impl QwdClient {
             (status.player_list.len() as f64 / capacity as f64).clamp(0.0, 1.0)
         };
         let facts = self.reservations.facts(
-            &status,
+            status,
             capacity,
             self.telemetry_seq.wrapping_add(1),
             Instant::now(),
@@ -106,6 +116,7 @@ impl QwdClient {
         let current: HashMap<String, Value> = status
             .player_list
             .iter()
+            .filter(|player| !player.moving)
             .take(8)
             .map(|player| {
                 (
@@ -131,7 +142,7 @@ impl QwdClient {
             && seq.wrapping_sub(self.last_full_telemetry_seq) < TELEMETRY_FULL_RESYNC_FRAMES
             && now.duration_since(self.last_full_telemetry_at)
                 < Duration::from_millis(TELEMETRY_FULL_RESYNC_MS);
-        self.force_full = false;
+        let mut next_sent_at = self.last_telemetry_sent_at.clone();
 
         let mut data = Map::new();
         data.insert("roomId".to_string(), json!(self.room_id));
@@ -179,7 +190,6 @@ impl QwdClient {
                 // recently, so no frame is published and the sequence must not
                 // advance: the manager's cached room version has to stay equal
                 // to the last seq it actually received.
-                self.telemetry_roster = Some(current);
                 return Ok(());
             }
 
@@ -190,30 +200,34 @@ impl QwdClient {
 
             for player in &changed {
                 if let Some(player_id) = player.get("playerId").and_then(Value::as_str) {
-                    self.last_telemetry_sent_at
-                        .insert(player_id.to_string(), now);
+                    next_sent_at.insert(player_id.to_string(), now);
                 }
             }
             for player_id in &removed {
-                self.last_telemetry_sent_at.remove(player_id);
+                next_sent_at.remove(player_id);
             }
         } else {
             let players: Vec<Value> = current.values().cloned().collect();
             data.insert("players".to_string(), Value::Array(players));
-            self.last_full_telemetry_seq = seq;
-            self.last_full_telemetry_at = now;
-            self.last_telemetry_sent_at = current
+            next_sent_at = current
                 .keys()
                 .map(|player_id| (player_id.clone(), now))
                 .collect();
         }
 
+        let value = event("room.telemetry", Value::Object(data));
+        send(self, &value)?;
+
         self.telemetry_seq = seq;
         self.telemetry_roster = Some(current);
         self.last_telemetry_seq_sent = seq;
-
-        let value = event("room.telemetry", Value::Object(data));
-        self.send_json(socket, &value)
+        self.last_telemetry_sent_at = next_sent_at;
+        if !can_delta {
+            self.last_full_telemetry_seq = seq;
+            self.last_full_telemetry_at = now;
+        }
+        self.force_full = false;
+        Ok(())
     }
 
     pub(super) fn send_node_draining(&self, socket: &mut Socket) -> Result<(), String> {
@@ -231,30 +245,37 @@ impl QwdClient {
 
 /// Compare only the fields XYSKY uses to decide whether a player changed.
 /// Timestamps move on every packet and must not defeat delta compression; the
-/// move status is compared so a transition to/from MOVING is always published.
+/// move status and host flag are compared so a transition to/from MOVING and a
+/// host handover are always published.
 fn same_telemetry(a: &Value, b: &Value) -> bool {
-    a.get("levelId") == b.get("levelId")
+    a.get("sessionId") == b.get("sessionId")
+        && a.get("levelId") == b.get("levelId")
         && a.get("position") == b.get("position")
         && a.get("velocity") == b.get("velocity")
         && a.get("affinity") == b.get("affinity")
         && a.get("status") == b.get("status")
         && a.get("lvSeq") == b.get("lvSeq")
+        && a.get("isHost") == b.get("isHost")
+        && a.get("levelHash") == b.get("levelHash")
 }
 
 /// Shape one player's QWD telemetry entry. Optional fields mirror XYSKY, which
 /// omits them when the corresponding data is unavailable.
-fn player_telemetry(player: &PlayerInfo, status_fields: bool) -> Value {
+fn player_telemetry(player: &PlayerInfo, _status_fields: bool) -> Value {
     let mut value = json!({
         "playerId": player.uuid,
         "levelId": player.level_id,
     });
-    if let Some(session) = player.session_id {
-        value["sessionId"] = json!(session.to_string());
+    // Session identity, level generation and the host flag are mandatory
+    // safety metadata on every entry, even when an older manager rejects
+    // optional player status fields.
+    value["sessionId"] = json!(player.session_id);
+    value["lvSeq"] = json!(player.lv_seq);
+    value["isHost"] = json!(player.is_host);
+    if let Some(level_hash) = player.level_hash {
+        value["levelHash"] = json!(level_hash);
     }
-    if status_fields {
-        value["lvSeq"] = json!(player.lv_seq);
-        value["status"] = json!(player_status(player.moving));
-    }
+    value["status"] = json!(player_status(player.moving));
     if player.state_at > 0 {
         value["stateAt"] = json!(player.state_at);
     }
@@ -297,7 +318,9 @@ mod tests {
             level_id,
             lv_seq: 0,
             moving: false,
-            session_id: None,
+            session_id: "session-1".to_string(),
+            is_host: false,
+            level_hash: None,
             position: Some([1.0, 2.0, 3.0]),
             velocity: Some(4.0),
             state_at: 100,
@@ -324,5 +347,26 @@ mod tests {
         assert_eq!(value["position"], json!([1.0, 2.0, 3.0]));
         assert_eq!(value["velocity"], json!(4.0));
         assert_eq!(value["affinity"]["player-2"], json!(0.5));
+    }
+
+    #[test]
+    fn telemetry_entry_always_carries_session_id_and_host_flag() {
+        // sessionId, lvSeq and isHost are mandatory on every entry, even with
+        // the optional status fields disabled for an older manager.
+        for status_fields in [true, false] {
+            let value = player_telemetry(&player(7), status_fields);
+            assert_eq!(value["sessionId"], json!("session-1"));
+            assert_eq!(value["lvSeq"], json!(0));
+            assert_eq!(value["isHost"], json!(false));
+            assert_eq!(value["status"], json!("ACTIVE"));
+        }
+    }
+
+    #[test]
+    fn host_flag_change_is_a_telemetry_change() {
+        let base = player_telemetry(&player(7), true);
+        let mut promoted = player(7);
+        promoted.is_host = true;
+        assert!(!same_telemetry(&base, &player_telemetry(&promoted, true)));
     }
 }

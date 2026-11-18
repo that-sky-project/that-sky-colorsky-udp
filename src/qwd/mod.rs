@@ -5,11 +5,13 @@
 //! events are converted into QWD `player.*`, `room.telemetry` and `move.result`
 //! messages.
 
+mod command_cache;
 mod commands;
 mod compat;
 mod events;
 mod facts;
 mod move_commit;
+mod outbox;
 mod protocol;
 mod reservations;
 mod settle;
@@ -28,10 +30,12 @@ use tungstenite::{Error as WsError, Message, WebSocket, connect};
 
 use crate::control::{ControlHandle, ControlResponse, ServerEvent, ServerStatus};
 
+use command_cache::CommandCache;
 use compat::ManagerCaps;
 use reservations::Reservations;
 use util::{
-    control_error, endpoint_url, generate_node_id, generate_room_id, init_tls, set_read_timeout,
+    control_error, endpoint_url, generate_node_id, generate_room_id, init_tls, redacted_endpoint,
+    set_socket_timeouts,
 };
 
 type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
@@ -83,32 +87,25 @@ pub struct QwdClient {
     control: ControlHandle,
     events: Receiver<ServerEvent>,
     reservations: Reservations,
-    /// Stable node identity reported as `?node=` so a reconnect can be matched
-    /// to the connection it replaces.
+    /// Stable process identity, retained across socket reconnects.
     node_id: String,
     room_id: String,
     telemetry_seq: u64,
-    /// Last player telemetry sent, used to build differential frames.
+    /// Last successfully sent player telemetry, used for differential frames.
     telemetry_roster: Option<HashMap<String, Value>>,
-    /// When each player last appeared on the wire, used to keep idle players
-    /// fresh for the manager's planner.
     last_telemetry_sent_at: HashMap<String, Instant>,
-    /// Sequence of the last telemetry frame actually sent.
     last_telemetry_seq_sent: u64,
-    /// Sequence of the last full telemetry snapshot.
     last_full_telemetry_seq: u64,
     last_full_telemetry_at: Instant,
-    /// Last manager error signature, to avoid repeating the same warning.
     last_manager_error: Option<String>,
-    /// Events the connected manager accepts. Older builds reject the newest
-    /// ones, so the adapter degrades instead of losing every frame.
     caps: ManagerCaps,
-    /// Set by `room.sync`: the next telemetry tick must publish a full frame
-    /// even if the differential roster would normally skip it.
+    /// Cleared only after successfully publishing a full snapshot.
     force_full: bool,
     draining: bool,
     internal_to_qwd: HashMap<u64, String>,
     qwd_moves: HashMap<String, PendingQwdMove>,
+    command_cache: CommandCache,
+    pending_events: outbox::EventOutbox,
 }
 
 impl QwdClient {
@@ -134,10 +131,12 @@ impl QwdClient {
                 last_full_telemetry_at: Instant::now(),
                 last_manager_error: None,
                 caps: ManagerCaps::default(),
-                force_full: false,
+                force_full: true,
                 draining: false,
                 internal_to_qwd: HashMap::new(),
                 qwd_moves: HashMap::new(),
+                command_cache: CommandCache::new(),
+                pending_events: outbox::EventOutbox::new(),
             }
             .run();
         })
@@ -149,11 +148,8 @@ impl QwdClient {
                 Ok(()) => tracing::info!("[QWD] connection closed"),
                 Err(error) => tracing::warn!(error = %error, "[QWD] connection failed"),
             }
-
-            self.reservations.clear();
-            self.internal_to_qwd.clear();
-            self.qwd_moves.clear();
-            self.discard_queued_events();
+            // Business state and queued move outcomes survive transport loss.
+            // Failed reconnect attempts must not restart any lease/grace clock.
             thread::sleep(self.config.reconnect_delay);
         }
     }
@@ -161,74 +157,87 @@ impl QwdClient {
     fn connect_once(&mut self) -> Result<(), String> {
         init_tls();
         let endpoint = endpoint_url(&self.config.url, &self.node_id)?;
-        let (mut socket, _) = connect(endpoint.as_str()).map_err(|error| error.to_string())?;
-        set_read_timeout(&mut socket, Some(Duration::from_millis(250)))
-            .map_err(|error| error.to_string())?;
-
+        let (mut socket, _) =
+            connect(endpoint.as_str()).map_err(|_| "QWD WebSocket handshake failed".to_string())?;
+        self.command_cache.clear();
+        self.reset_transport_baseline();
         tracing::info!(
-            endpoint = %endpoint,
+            endpoint = %redacted_endpoint(&endpoint),
             room_id = %self.room_id,
             node_id = %self.node_id,
             "[QWD] connected"
         );
+        let result = set_socket_timeouts(
+            &mut socket,
+            Some(Duration::from_millis(250)),
+            Some(Duration::from_secs(5)),
+        )
+        .map_err(|error| error.to_string())
+        .and_then(|()| self.run_socket(&mut socket));
 
-        self.reservations.clear();
-        self.internal_to_qwd.clear();
-        self.qwd_moves.clear();
-        // `telemetry_seq` is scoped to the room id, not the socket. QWD rejects
-        // a telemetry seq that is not strictly increasing for the same room,
-        // so a reconnect must continue from the previous value. Only
-        // `room.id_conflict` (which generates a new room id) resets it.
+        // Cap once per established connection loss. The reservation owner
+        // takes min(original expiry, now + grace); never extend a short lease.
+        self.reservations
+            .cap_transport_loss(Instant::now(), Duration::from_secs(15));
+        result
+    }
+
+    /// Reset socket-scoped telemetry state without losing room sequence,
+    /// reservation ownership or in-flight move settlement.
+    fn reset_transport_baseline(&mut self) {
         self.telemetry_roster = None;
         self.last_telemetry_sent_at.clear();
         self.last_telemetry_seq_sent = 0;
         self.last_full_telemetry_seq = 0;
         self.last_full_telemetry_at = Instant::now();
         self.last_manager_error = None;
+        self.caps = ManagerCaps::default();
+        self.force_full = true;
+    }
 
-        self.send_node_ready(&mut socket)?;
-        // No per-player `player.join` replay: the manager restores membership
-        // from `room.created` (which carries the authoritative player count)
-        // plus the full telemetry snapshot below. Replaying joins bumps the
-        // manager's occupancy once per player and double-counts rooms that
-        // survived in its grace window.
-        self.send_room_created(&mut socket)?;
+    fn run_socket(&mut self, socket: &mut Socket) -> Result<(), String> {
+        self.send_node_ready(socket)?;
+        // Registration plus a full telemetry snapshot restore membership.
+        self.send_room_created(socket)?;
         if self.draining {
-            self.send_node_draining(&mut socket)?;
+            self.send_node_draining(socket)?;
         }
-
+        self.send_telemetry(socket)?;
         let mut last_telemetry = Instant::now();
 
         loop {
-            self.drain_events(&mut socket)?;
-
+            self.flush_event_outbox(socket)?;
+            self.drain_events(socket)?;
             if last_telemetry.elapsed() >= Duration::from_secs(1) {
                 let expired = self.reservations.expire(Instant::now());
                 for expired_move in &expired {
-                    self.send_reservation_expired(&mut socket, expired_move)?;
+                    self.send_reservation_expired(socket, expired_move)?;
                 }
-                self.send_telemetry(&mut socket)?;
+                self.send_telemetry(socket)?;
                 last_telemetry = Instant::now();
             }
 
             match socket.read() {
-                Ok(Message::Text(text)) => {
-                    self.handle_command(&mut socket, text.as_str())?;
-                }
+                Ok(Message::Text(text)) => self.handle_command(socket, text.as_str())?,
                 Ok(Message::Binary(bytes)) => {
                     tracing::warn!(bytes = bytes.len(), "[QWD] ignored binary message");
                 }
                 Ok(Message::Ping(payload)) => {
                     socket
                         .send(Message::Pong(payload))
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|_| "QWD WebSocket pong failed".to_string())?;
                 }
-                Ok(Message::Pong(_)) | Ok(Message::Close(_)) => {}
-                Ok(_) => {}
+                Ok(Message::Close(_)) => {
+                    // Tungstenite queued the close reply; flush it once, then
+                    // end this connection rather than reading a closing socket.
+                    let _ = socket.flush();
+                    return Ok(());
+                }
+                Ok(Message::Pong(_)) | Ok(_) => {}
                 Err(WsError::Io(error))
                     if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
                 Err(WsError::ConnectionClosed | WsError::AlreadyClosed) => return Ok(()),
-                Err(error) => return Err(error.to_string()),
+                Err(_) => return Err("QWD WebSocket read failed".to_string()),
             }
         }
     }
@@ -237,23 +246,7 @@ impl QwdClient {
         let text = serde_json::to_string(value).map_err(|error| error.to_string())?;
         socket
             .send(Message::text(text))
-            .map_err(|error| error.to_string())
-    }
-
-    /// Drop events that queued up while the socket was down. They describe a
-    /// state the manager has already lost, and the reconnect replays the
-    /// authoritative snapshot below.
-    fn discard_queued_events(&mut self) {
-        let mut discarded = 0usize;
-        while self.events.try_recv().is_ok() {
-            discarded += 1;
-        }
-        if discarded > 0 {
-            tracing::warn!(
-                discarded,
-                "[QWD] discarded events queued while the manager was offline"
-            );
-        }
+            .map_err(|_| "QWD WebSocket send failed".to_string())
     }
 
     pub(super) fn status(&self) -> Result<ServerStatus, String> {

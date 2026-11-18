@@ -12,32 +12,77 @@ use super::Socket;
 
 /// Build the node control endpoint.
 ///
-/// QWD accepts node connections on the root path and reads the protocol version
-/// and the node identity from the query string. The node id is stable for the
-/// lifetime of the process so a reconnect lands inside the manager's grace
-/// window and its rooms can be restored, instead of appearing as a brand-new
-/// node until the old connection is swept.
+/// Preserve deployment paths and authentication query parameters. Reserved
+/// protocol keys are replaced once and node identity is percent encoded.
+/// Validation errors never include the original URL or its secrets.
 pub(super) fn endpoint_url(raw: &str, node_id: &str) -> Result<String, String> {
     let raw = raw.trim();
-    let (scheme, rest) = raw
-        .split_once("://")
-        .ok_or_else(|| "qwd.url must include ws:// or wss://".to_string())?;
-    let authority = rest.split('/').next().unwrap_or(rest);
-    if authority.is_empty() {
+    if !raw.contains("://") {
+        return Err("qwd.url must include ws:// or wss://".to_string());
+    }
+    let mut endpoint =
+        url::Url::parse(raw).map_err(|_| "qwd.url is not a valid WebSocket URL".to_string())?;
+    if !matches!(endpoint.scheme(), "ws" | "wss") {
+        return Err("qwd.url must use ws:// or wss://".to_string());
+    }
+    if endpoint.host_str().is_none() {
         return Err("qwd.url has no host".to_string());
     }
-    Ok(format!("{scheme}://{authority}/?v=1&node={node_id}"))
+    // Also reject syntactically empty userinfo, which Url normalizes away.
+    let authority = raw
+        .split_once("://")
+        .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or_default())
+        .unwrap_or_default();
+    if !endpoint.username().is_empty() || endpoint.password().is_some() || authority.contains('@') {
+        return Err("qwd.url must not contain credentials".to_string());
+    }
+    if endpoint.fragment().is_some() {
+        return Err("qwd.url must not contain a fragment".to_string());
+    }
+    // Keep untouched query segments byte-for-byte (signed tokens can depend
+    // on their encoding), while recognizing percent-encoded reserved keys.
+    let mut query: Vec<String> = endpoint
+        .query()
+        .unwrap_or_default()
+        .split('&')
+        .filter(|part| !part.is_empty())
+        .filter(|part| {
+            !url::form_urlencoded::parse(part.as_bytes())
+                .any(|(key, _)| key == "v" || key == "node")
+        })
+        .map(str::to_owned)
+        .collect();
+    let mut protocol = url::form_urlencoded::Serializer::new(String::new());
+    protocol.append_pair("v", "1").append_pair("node", node_id);
+    query.push(protocol.finish());
+    endpoint.set_query(Some(&query.join("&")));
+    Ok(endpoint.into())
 }
 
-pub(super) fn set_read_timeout(
+/// Log only the origin. Paths and query values may contain access tokens.
+pub(super) fn redacted_endpoint(endpoint: &str) -> String {
+    url::Url::parse(endpoint)
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_else(|_| "<invalid WebSocket endpoint>".to_string())
+}
+
+pub(super) fn set_socket_timeouts(
     socket: &mut Socket,
-    timeout: Option<Duration>,
+    read_timeout: Option<Duration>,
+    write_timeout: Option<Duration>,
 ) -> std::io::Result<()> {
-    match socket.get_mut() {
-        MaybeTlsStream::Plain(stream) => stream.set_read_timeout(timeout),
-        MaybeTlsStream::Rustls(stream) => stream.sock.set_read_timeout(timeout),
-        _ => Ok(()),
-    }
+    let stream = match socket.get_mut() {
+        MaybeTlsStream::Plain(stream) => stream,
+        MaybeTlsStream::Rustls(stream) => &mut stream.sock,
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "unsupported QWD TLS stream",
+            ));
+        }
+    };
+    stream.set_read_timeout(read_timeout)?;
+    stream.set_write_timeout(write_timeout)
 }
 
 pub(super) fn control_error(error: ControlError) -> String {

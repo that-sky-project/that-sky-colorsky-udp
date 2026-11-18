@@ -6,7 +6,7 @@ use std::net::IpAddr;
 
 use serde_json::json;
 
-use crate::control::{ControlResponse, RoomEndpoint};
+use crate::control::{ControlResponse, PlayerInfo, RoomEndpoint};
 use crate::protocol::net_address::NetAddress;
 use crate::protocol::types::TgcUuid;
 
@@ -17,6 +17,43 @@ use super::protocol::{
 use super::settle::MoveReport;
 use super::util::{control_error, destination_uuid, now_ms};
 use super::{AckParts, PendingQwdMove, QwdClient, Socket};
+
+/// Affinity weight at or above which a frozen bond must not be torn apart by
+/// a move commit (a client value of 230/255 or more).
+const BOND_THRESHOLD: f32 = 0.9;
+
+/// Enforce bond completeness for a move commit: for every moving player, each
+/// resolved affinity edge at or above [`BOND_THRESHOLD`] must point at another
+/// player in the moving group or at a peer that is no longer connected in this
+/// room. Bonds are never waived by moving or churn states, so a bonded peer
+/// that is still connected outside the group rejects the whole commit.
+/// Returns the rejection message naming both players for the first violation.
+fn bond_conflict(player_list: &[PlayerInfo], moving_group: &[String]) -> Option<String> {
+    let moving: HashSet<&str> = moving_group.iter().map(String::as_str).collect();
+    for player in player_list {
+        let player_moves = moving.contains(player.uuid.as_str());
+        for (peer_uuid, weight) in &player.affinity {
+            if *weight < BOND_THRESHOLD {
+                continue;
+            }
+            let Some(peer) = player_list.iter().find(|peer| peer.uuid == *peer_uuid) else {
+                continue;
+            };
+            let peer_moves = moving.contains(peer.uuid.as_str());
+            if player_moves != peer_moves {
+                let (moving_player, outside_peer) = if player_moves {
+                    (&player.uuid, &peer.uuid)
+                } else {
+                    (&peer.uuid, &player.uuid)
+                };
+                return Some(format!(
+                    "player {moving_player} cannot move: bonded peer {outside_peer} (affinity {weight:.3}) is still connected in this room and not in the moving group"
+                ));
+            }
+        }
+    }
+    None
+}
 
 impl QwdClient {
     pub(super) fn handle_move_commit(
@@ -29,7 +66,23 @@ impl QwdClient {
             .map(str::to_string)
             .unwrap_or_else(|| format!("redirect-{}-{}", now_ms(), command.id));
 
-        let player_ids = command.player_ids();
+        let player_ids = match command.player_ids() {
+            Ok(ids) => ids,
+            Err(message) => return Ok((BAD_REQUEST, Some(message), None)),
+        };
+        let deadline_ms = match command.data.get("expiresAt") {
+            None => None,
+            Some(value) => match value.as_u64() {
+                Some(deadline) if deadline > now_ms() => Some(deadline),
+                _ => {
+                    return Ok((
+                        STALE_PLAN,
+                        Some("invalid or expired move delivery deadline".into()),
+                        None,
+                    ));
+                }
+            },
+        };
         if player_ids.is_empty() || player_ids.len() > 7 {
             return Ok((
                 BAD_REQUEST,
@@ -51,33 +104,32 @@ impl QwdClient {
             .string_field("reservationToken")
             .map(str::to_string)
             .or_else(|| self.reservations.token_of(&move_id).map(str::to_string));
-        if let Some(guard) = command.data.get("expectedParticipants") {
-            for expected in expected_participants(guard) {
-                let Some(player) = status
-                    .player_list
+        let guards = match command.data.get("expectedParticipants") {
+            None => Vec::new(),
+            Some(value) => match expected_participants(value) {
+                Ok(guards) => guards,
+                Err(message) => return Ok((BAD_REQUEST, Some(message), None)),
+            },
+        };
+        if !guards.is_empty()
+            && (guards.len() != player_ids.len()
+                || guards
                     .iter()
-                    .find(|player| player.uuid == expected.player_id)
-                else {
-                    continue;
-                };
-                if !participant_matches(&expected, player) {
-                    self.send_move_result(
-                        socket,
-                        MoveReport {
-                            move_id: &move_id,
-                            accepted: false,
-                            moved: &[],
-                            failed: std::slice::from_ref(&expected.player_id),
-                            reason: Some("source_participant_changed"),
-                            token: reservation_token.as_deref(),
-                        },
-                    )?;
-                    return Ok((
-                        STALE_PLAN,
-                        Some("source participant changed".to_string()),
-                        Some(json!({ "playerId": expected.player_id })),
-                    ));
-                }
+                    .any(|guard| !player_ids.contains(&guard.player_id)))
+        {
+            return Ok((
+                BAD_REQUEST,
+                Some("participant guards must exactly match playerIds".into()),
+                None,
+            ));
+        }
+        for guard in &guards {
+            if !status
+                .player_list
+                .iter()
+                .any(|player| participant_matches(guard, player))
+            {
+                return Ok((STALE_PLAN, Some("source participant changed".into()), None));
             }
         }
 
@@ -162,6 +214,25 @@ impl QwdClient {
             ));
         }
 
+        // Bond completeness: a strong frozen bond must move with its group or
+        // already be gone. This runs before the room is registered and before
+        // any MoveGame can be enqueued, so a rejected commit sends nothing to
+        // the clients.
+        if let Some(message) = bond_conflict(&status.player_list, &player_ids) {
+            self.send_move_result(
+                socket,
+                MoveReport {
+                    move_id: &move_id,
+                    accepted: false,
+                    moved: &[],
+                    failed: &player_ids,
+                    reason: Some(&message),
+                    token: reservation_token.as_deref(),
+                },
+            )?;
+            return Ok((CONFLICT, Some(message), Some(json!({ "accepted": false }))));
+        }
+
         let room = RoomEndpoint {
             id: to_room_id.to_string(),
             address: NetAddress::new(host, udp_port as u16),
@@ -186,7 +257,27 @@ impl QwdClient {
             return Ok((INTERNAL, Some(message), None));
         }
 
-        match self.control.move_players(net_ids, to_room_id) {
+        // Even a redirect without manager-supplied guards is fenced to the
+        // exact status snapshot used above; native ids may be reused before
+        // this command reaches the ENet thread.
+        let execution_guards = status
+            .player_list
+            .iter()
+            .filter(|player| player_ids.contains(&player.uuid))
+            .map(|player| crate::control::ExpectedPlayerGuard {
+                player_id: player.player_id,
+                uuid: player.uuid.clone(),
+                session_id: player.session_id.clone(),
+                level_id: player.level_id,
+                lv_seq: player.lv_seq,
+            })
+            .collect();
+        match self.control.move_players_guarded(
+            net_ids,
+            to_room_id.to_string(),
+            execution_guards,
+            deadline_ms,
+        ) {
             Ok(ControlResponse::Move(outcome)) => {
                 if outcome.moved.is_empty() {
                     self.send_move_result(
@@ -217,8 +308,16 @@ impl QwdClient {
                     PendingQwdMove {
                         pending,
                         moved: Vec::new(),
-                        failed: Vec::new(),
-                        reason: None,
+                        failed: outcome
+                            .failed
+                            .iter()
+                            .filter_map(|id| net_to_uuid.get(id).cloned())
+                            .collect(),
+                        reason: if outcome.failed.is_empty() {
+                            None
+                        } else {
+                            Some("partial_source_rejection".into())
+                        },
                         token: reservation_token,
                     },
                 );
@@ -275,5 +374,88 @@ impl QwdClient {
                 Ok((NODE_UNAVAILABLE, Some(message), None))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bond_conflict;
+    use crate::control::PlayerInfo;
+
+    fn player(uuid: &str, affinity: Vec<(&str, f32)>) -> PlayerInfo {
+        PlayerInfo {
+            player_id: 0,
+            uuid: uuid.to_string(),
+            level_id: 7,
+            lv_seq: 0,
+            moving: false,
+            session_id: format!("{uuid}-session"),
+            is_host: false,
+            level_hash: None,
+            position: None,
+            velocity: None,
+            state_at: 0,
+            last_move_at: 0,
+            affinity: affinity
+                .into_iter()
+                .map(|(peer, weight)| (peer.to_string(), weight))
+                .collect(),
+        }
+    }
+
+    fn group(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    #[test]
+    fn connected_bonded_peer_outside_the_group_is_rejected_with_both_ids() {
+        let roster = [
+            player("mover", vec![("bonded", 1.0)]),
+            player("bonded", vec![]),
+            player("bystander", vec![]),
+        ];
+        let message = bond_conflict(&roster, &group(&["mover"])).expect("bond conflict");
+        assert!(message.contains("mover"), "{message}");
+        assert!(message.contains("bonded"), "{message}");
+    }
+
+    #[test]
+    fn threshold_is_value_230_of_255() {
+        // 230/255 >= 0.9 bonds and must not be left behind.
+        let strong = [
+            player("mover", vec![("bonded", 230.0 / 255.0)]),
+            player("bonded", vec![]),
+        ];
+        assert!(bond_conflict(&strong, &group(&["mover"])).is_some());
+
+        // 229/255 < 0.9 is not a bond.
+        let weak = [
+            player("mover", vec![("bonded", 229.0 / 255.0)]),
+            player("bonded", vec![]),
+        ];
+        assert!(bond_conflict(&weak, &group(&["mover"])).is_none());
+    }
+
+    #[test]
+    fn bonded_peer_inside_the_group_or_already_gone_allows_the_move() {
+        // The whole bonded pair moves together.
+        let together = [
+            player("mover", vec![("peer", 1.0)]),
+            player("peer", vec![("mover", 1.0)]),
+        ];
+        assert!(bond_conflict(&together, &group(&["mover", "peer"])).is_none());
+
+        // The bonded peer disconnected before the commit: solo move passes.
+        let solo = [player("mover", vec![("gone", 1.0)])];
+        assert!(bond_conflict(&solo, &group(&["mover"])).is_none());
+    }
+
+    #[test]
+    fn bonds_of_players_outside_the_group_do_not_block_other_moves() {
+        let roster = [
+            player("mover", vec![]),
+            player("stayer", vec![("gone", 1.0)]),
+        ];
+        assert!(bond_conflict(&roster, &group(&["mover"])).is_none());
     }
 }
